@@ -438,6 +438,7 @@ struct TrackedPlayerBox: Identifiable, Equatable, Hashable {
     let playerAreaPoint: CGPoint?
     let lateralPosition: String?
     let depthPosition: String?
+    let isCurrentHitter: Bool
 
     init(
         id: String,
@@ -446,7 +447,8 @@ struct TrackedPlayerBox: Identifiable, Equatable, Hashable {
         footPoint: CGPoint? = nil,
         playerAreaPoint: CGPoint? = nil,
         lateralPosition: String? = nil,
-        depthPosition: String? = nil
+        depthPosition: String? = nil,
+        isCurrentHitter: Bool = false
     ) {
         self.id = id
         self.label = label
@@ -455,6 +457,7 @@ struct TrackedPlayerBox: Identifiable, Equatable, Hashable {
         self.playerAreaPoint = playerAreaPoint
         self.lateralPosition = lateralPosition
         self.depthPosition = depthPosition
+        self.isCurrentHitter = isCurrentHitter
     }
 }
 
@@ -2910,7 +2913,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
     }
 
     private func annotatePlayers(_ players: [TrackedPlayerBox]) -> [TrackedPlayerBox] {
-        let annotatedPlayers = players.map { player -> TrackedPlayerBox in
+        let baseAnnotatedPlayers = players.map { player -> TrackedPlayerBox in
             let footPoint = playerFootPoint(for: player.boundingBox)
             let mappedPoint = playerAreaCalibration?.normalizedPoint(forCapturePoint: footPoint)
             return TrackedPlayerBox(
@@ -2924,8 +2927,34 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             )
         }
 
+        let hitterID = currentHitterID(from: baseAnnotatedPlayers)
+        let annotatedPlayers = baseAnnotatedPlayers.map { player in
+            TrackedPlayerBox(
+                id: player.id,
+                label: player.label,
+                boundingBox: player.boundingBox,
+                footPoint: player.footPoint,
+                playerAreaPoint: player.playerAreaPoint,
+                lateralPosition: player.lateralPosition,
+                depthPosition: player.depthPosition,
+                isCurrentHitter: player.id == hitterID
+            )
+        }
+
         updateSpatialStatus(with: annotatedPlayers)
         return annotatedPlayers
+    }
+
+    private func currentHitterID(from players: [TrackedPlayerBox]) -> String? {
+        let mappedPlayers = players.compactMap { player -> (String, CGPoint)? in
+            guard let playerAreaPoint = player.playerAreaPoint else { return nil }
+            return (player.id, playerAreaPoint)
+        }
+
+        guard mappedPlayers.count == 2 else { return nil }
+        return mappedPlayers.min(by: { lhs, rhs in
+            lhs.1.y < rhs.1.y
+        })?.0
     }
 
     private func playerFootPoint(for boundingBox: CGRect) -> CGPoint {
@@ -3037,7 +3066,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 playerAreaSummary = ""
             }
 
-            return "\(player.label) x:\(formatDebugValue(player.boundingBox.midX)) y:\(formatDebugValue(player.boundingBox.midY))\(playerAreaSummary)"
+            let hitterSummary = player.isCurrentHitter ? " hitter" : ""
+            return "\(player.label) x:\(formatDebugValue(player.boundingBox.midX)) y:\(formatDebugValue(player.boundingBox.midY))\(playerAreaSummary)\(hitterSummary)"
         }
 
         DispatchQueue.main.async {
@@ -3207,7 +3237,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             )
         else { return }
 
-        context.setStrokeColor(UIColor.systemGreen.cgColor)
         context.setLineWidth(6)
         context.setFillColor(UIColor.systemGreen.cgColor)
 
@@ -3225,6 +3254,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 width: sourceRect.width,
                 height: sourceRect.height
             )
+            context.setStrokeColor((player.isCurrentHitter ? UIColor.systemRed : UIColor.systemGreen).cgColor)
             context.stroke(rect.insetBy(dx: 1, dy: 1))
 
             let bubbleSize = CGSize(width: 132, height: 52)
@@ -3530,11 +3560,12 @@ final class PreviewView: UIView {
         .sorted { $0.rect.minX < $1.rect.minX }
 
         for (index, item) in positionedPlayers.enumerated() {
+            let player = item.player
             let convertedRect = item.rect
             let displayLabel = index == 0 ? "Player1" : "Player2"
             let shapeLayer = CAShapeLayer()
             shapeLayer.path = UIBezierPath(rect: convertedRect).cgPath
-            shapeLayer.strokeColor = UIColor.systemGreen.cgColor
+            shapeLayer.strokeColor = (player.isCurrentHitter ? UIColor.systemRed : UIColor.systemGreen).cgColor
             shapeLayer.fillColor = UIColor.clear.cgColor
             shapeLayer.lineWidth = 3
             shapeLayer.cornerRadius = 12
