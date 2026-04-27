@@ -485,6 +485,66 @@ enum RallyState: String {
     }
 }
 
+private enum RallyFeedback: String, CaseIterable {
+    case p1RecoverEarlier = "Player 1, recover earlier."
+    case p2RecoverEarlier = "Player 2, recover earlier."
+    case p1MoveOutAfterHitting = "Player 1, move out after hitting."
+    case p2MoveOutAfterHitting = "Player 2, move out after hitting."
+}
+
+private final class RallyFeedbackSpeaker {
+    private let synthesizer = AVSpeechSynthesizer()
+
+    @discardableResult
+    func speak(_ feedback: [RallyFeedback]) -> CFTimeInterval {
+        guard !feedback.isEmpty else { return 0 }
+
+        let estimatedDuration = (Double(feedback.count) * 2.1) + 0.4
+
+        DispatchQueue.main.async {
+            self.activateAudioSessionIfPossible()
+
+            if self.synthesizer.isSpeaking {
+                self.synthesizer.stopSpeaking(at: .immediate)
+            }
+
+            for item in feedback {
+                let utterance = AVSpeechUtterance(string: item.rawValue)
+                utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+                utterance.rate = 0.48
+                utterance.pitchMultiplier = 0.95
+                utterance.postUtteranceDelay = 0.12
+                self.synthesizer.speak(utterance)
+            }
+        }
+
+        return estimatedDuration
+    }
+
+    func stop() {
+        DispatchQueue.main.async {
+            if self.synthesizer.isSpeaking {
+                self.synthesizer.stopSpeaking(at: .immediate)
+            }
+        }
+    }
+
+    private func activateAudioSessionIfPossible() {
+        let audioSession = AVAudioSession.sharedInstance()
+
+        do {
+            try audioSession.setCategory(
+                .playAndRecord,
+                mode: .default,
+                options: [.defaultToSpeaker, .allowBluetoothHFP, .mixWithOthers]
+            )
+            try audioSession.setActive(true)
+        } catch {
+            print("Failed to activate feedback audio session: \(error)")
+        }
+    }
+}
+
 enum CalibrationCorner: Int, CaseIterable {
     case topLeft
     case topRight
@@ -2223,6 +2283,12 @@ final class CameraManager: NSObject, ObservableObject {
         static let fallbackFrameLimit = 6
     }
 
+    private enum RallyFeedbackConstants {
+        static let recoverCheckDelay: Double = 0.5
+        static let recoverDistanceThreshold: CGFloat = 0.22
+        static let moveOutAfterHittingDuration: Double = 1.0
+    }
+
     let session = AVCaptureSession()
     @Published private(set) var trackedPlayers: [TrackedPlayerBox] = []
     @Published private(set) var trackingDebugInfo = TrackingDebugInfo()
@@ -2236,13 +2302,28 @@ final class CameraManager: NSObject, ObservableObject {
     private let sessionQueue = DispatchQueue(label: "TTCoach.CameraSessionQueue", qos: .userInitiated)
     private let visionQueue = DispatchQueue(label: "TTCoach.HumanDetectionQueue", qos: .userInitiated)
     private let audioQueue = DispatchQueue(label: "TTCoach.AudioDetectionQueue", qos: .userInitiated)
+    private let rallyAnalysisQueue = DispatchQueue(label: "TTCoach.RallyAnalysisQueue", qos: .userInitiated)
     private let ciContext = CIContext()
+    private let rallyFeedbackSpeaker = RallyFeedbackSpeaker()
 
     private struct HumanDetectionResult {
         let source: String
         let rectangleCandidates: [CGRect]
         let bodyPoseCandidates: [CGRect]
         let selectedCandidates: [CGRect]
+    }
+
+    private struct ActiveHitterState {
+        let hitterID: String
+        let startedAt: Double
+        let didTriggerMoveOutFeedback: Bool
+        let isMoveOutFeedbackExempt: Bool
+    }
+
+    private struct PendingRecoverCheck {
+        let hitterID: String
+        let nonHitterID: String
+        let dueTime: Double
     }
 
     private var isConfigured = false
@@ -2268,6 +2349,11 @@ final class CameraManager: NSObject, ObservableObject {
     private var audioFloorLevel: Float = 0.01
     private var lastImpactTimestamp: Double = -.greatestFiniteMagnitude
     private var lastAudioTimestamp: Double = 0
+    private var currentRallyState: RallyState = .end
+    private var activeHitterState: ActiveHitterState?
+    private var pendingRecoverChecks: [PendingRecoverCheck] = []
+    private var queuedRallyFeedback = Set<RallyFeedback>()
+    private var audioFeedbackMuteUntil: CFTimeInterval = 0
 
     func requestPermissionAndStart(completion: @escaping (Bool) -> Void) {
         requestCapturePermissions { granted in
@@ -2314,7 +2400,7 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     func rallyEnded() {
-        updateRallyState(.end)
+        transitionRallyState(to: .end, playFeedback: false)
     }
 
     func updatePlayerAreaCalibration(_ calibration: PlayerAreaCalibration?) {
@@ -2413,6 +2499,7 @@ final class CameraManager: NSObject, ObservableObject {
         audioFloorLevel = 0.01
         lastImpactTimestamp = -.greatestFiniteMagnitude
         lastAudioTimestamp = 0
+        resetRallyAnalysisState()
         DispatchQueue.main.async {
             self.isRecordingActive = true
             self.rallyState = .end
@@ -2431,6 +2518,7 @@ final class CameraManager: NSObject, ObservableObject {
         recordingCropRect = .zero
         recordingRenderSize = .zero
         recordingSourceCanvasSize = .zero
+        resetRallyAnalysisState()
 
         if session.isRunning {
             session.stopRunning()
@@ -2499,6 +2587,197 @@ final class CameraManager: NSObject, ObservableObject {
             self.rallyState = newState
         }
     }
+
+    private func rallyStateSnapshot() -> RallyState {
+        rallyAnalysisQueue.sync {
+            currentRallyState
+        }
+    }
+
+    private func resetRallyAnalysisState() {
+        rallyAnalysisQueue.sync {
+            resetRallyAnalysisStateLocked()
+            currentRallyState = .end
+            audioFeedbackMuteUntil = 0
+        }
+        rallyFeedbackSpeaker.stop()
+    }
+
+    private func transitionRallyState(to newState: RallyState, playFeedback: Bool) {
+        let feedbackToPlay: [RallyFeedback] = rallyAnalysisQueue.sync {
+            let previousState = currentRallyState
+            currentRallyState = newState
+
+            switch newState {
+            case .start:
+                if previousState != .start {
+                    resetRallyAnalysisStateLocked()
+                }
+                return []
+
+            case .end:
+                let feedback = playFeedback && previousState == .start
+                    ? orderedQueuedFeedbackLocked()
+                    : []
+                resetRallyAnalysisStateLocked()
+                return feedback
+            }
+        }
+
+        updateRallyState(newState)
+
+        guard !feedbackToPlay.isEmpty else { return }
+
+        let muteDuration = rallyFeedbackSpeaker.speak(feedbackToPlay)
+        rallyAnalysisQueue.async {
+            self.audioFeedbackMuteUntil = CACurrentMediaTime() + muteDuration
+        }
+    }
+
+    private func resetRallyAnalysisStateLocked() {
+        activeHitterState = nil
+        pendingRecoverChecks = []
+        queuedRallyFeedback = []
+    }
+
+    private func orderedQueuedFeedbackLocked() -> [RallyFeedback] {
+        RallyFeedback.allCases.filter { queuedRallyFeedback.contains($0) }
+    }
+
+    private func updateRallyFeedbackTracking(with players: [TrackedPlayerBox], timestamp: Double) {
+        guard timestamp.isFinite else { return }
+
+        let playerLookup = Dictionary(uniqueKeysWithValues: players.map { ($0.id, $0) })
+        let hitterID = players.first(where: \.isCurrentHitter)?.id
+
+        rallyAnalysisQueue.async {
+            guard self.currentRallyState == .start else { return }
+
+            self.resolvePendingRecoverChecksLocked(
+                using: playerLookup,
+                currentHitterID: hitterID,
+                timestamp: timestamp
+            )
+
+            guard
+                let hitterID,
+                playerLookup[hitterID]?.playerAreaPoint != nil,
+                let nonHitterID = playerLookup.keys.first(where: { $0 != hitterID }),
+                playerLookup[nonHitterID]?.playerAreaPoint != nil
+            else {
+                return
+            }
+
+            if let activeHitterState = self.activeHitterState {
+                if activeHitterState.hitterID != hitterID {
+                    self.pendingRecoverChecks.append(
+                        PendingRecoverCheck(
+                            hitterID: hitterID,
+                            nonHitterID: nonHitterID,
+                            dueTime: timestamp + RallyFeedbackConstants.recoverCheckDelay
+                        )
+                    )
+                    self.activeHitterState = ActiveHitterState(
+                        hitterID: hitterID,
+                        startedAt: timestamp,
+                        didTriggerMoveOutFeedback: false,
+                        isMoveOutFeedbackExempt: false
+                    )
+                    return
+                }
+
+                if
+                    !activeHitterState.isMoveOutFeedbackExempt,
+                    !activeHitterState.didTriggerMoveOutFeedback,
+                    (timestamp - activeHitterState.startedAt) >= RallyFeedbackConstants.moveOutAfterHittingDuration
+                {
+                    self.queueMoveOutFeedbackLocked(for: hitterID)
+                    self.activeHitterState = ActiveHitterState(
+                        hitterID: hitterID,
+                        startedAt: activeHitterState.startedAt,
+                        didTriggerMoveOutFeedback: true,
+                        isMoveOutFeedbackExempt: false
+                    )
+                }
+                return
+            }
+
+            self.pendingRecoverChecks.append(
+                PendingRecoverCheck(
+                    hitterID: hitterID,
+                    nonHitterID: nonHitterID,
+                    dueTime: timestamp + RallyFeedbackConstants.recoverCheckDelay
+                )
+            )
+            self.activeHitterState = ActiveHitterState(
+                hitterID: hitterID,
+                startedAt: timestamp,
+                didTriggerMoveOutFeedback: false,
+                isMoveOutFeedbackExempt: true
+            )
+        }
+    }
+
+    private func resolvePendingRecoverChecksLocked(
+        using playerLookup: [String: TrackedPlayerBox],
+        currentHitterID: String?,
+        timestamp: Double
+    ) {
+        guard !pendingRecoverChecks.isEmpty else { return }
+
+        var remainingChecks: [PendingRecoverCheck] = []
+
+        for check in pendingRecoverChecks {
+            guard timestamp >= check.dueTime else {
+                remainingChecks.append(check)
+                continue
+            }
+
+            guard
+                currentHitterID == check.hitterID,
+                let hitterPoint = playerLookup[check.hitterID]?.playerAreaPoint,
+                let nonHitterPoint = playerLookup[check.nonHitterID]?.playerAreaPoint
+            else {
+                continue
+            }
+
+            let distance = hypot(hitterPoint.x - nonHitterPoint.x, hitterPoint.y - nonHitterPoint.y)
+            if distance <= RallyFeedbackConstants.recoverDistanceThreshold {
+                queueRecoverEarlierFeedbackLocked(for: check.nonHitterID)
+            }
+        }
+
+        pendingRecoverChecks = remainingChecks
+    }
+
+    private func queueRecoverEarlierFeedbackLocked(for playerID: String) {
+        switch playerID {
+        case "Player1":
+            queuedRallyFeedback.insert(.p1RecoverEarlier)
+        case "Player2":
+            queuedRallyFeedback.insert(.p2RecoverEarlier)
+        default:
+            break
+        }
+    }
+
+    private func queueMoveOutFeedbackLocked(for playerID: String) {
+        switch playerID {
+        case "Player1":
+            queuedRallyFeedback.insert(.p1MoveOutAfterHitting)
+        case "Player2":
+            queuedRallyFeedback.insert(.p2MoveOutAfterHitting)
+        default:
+            break
+        }
+    }
+
+    private func isAudioFeedbackMuted() -> Bool {
+        let now = CACurrentMediaTime()
+        return rallyAnalysisQueue.sync {
+            now < audioFeedbackMuteUntil
+        }
+    }
 }
 
 extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -2514,13 +2793,14 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         appendFrameToRecording(sampleBuffer)
 
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
         frameCounter += 1
 
         guard frameCounter.isMultiple(of: TrackingConstants.detectionInterval) else { return }
-        detectLivePlayers(in: pixelBuffer)
+        detectLivePlayers(in: pixelBuffer, timestamp: timestamp)
     }
 
-    private func detectLivePlayers(in pixelBuffer: CVPixelBuffer) {
+    private func detectLivePlayers(in pixelBuffer: CVPixelBuffer, timestamp: Double) {
         do {
             let detectionResult = try detectHumanBoundingBoxes(in: pixelBuffer)
             let boundingBoxes = detectionResult.selectedCandidates
@@ -2565,6 +2845,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             let players = associatedPlayers(from: boundingBoxes, previousPlayers: latestTrackedPlayers)
             let smoothedPlayers = smoothedPlayers(from: players)
             let annotatedPlayers = annotatePlayers(smoothedPlayers)
+            updateRallyFeedbackTracking(with: annotatedPlayers, timestamp: timestamp)
             updateTrackingRequests(from: annotatedPlayers)
             updateTrackedPlayers(annotatedPlayers)
             updateTrackingDebugInfo(
@@ -2709,14 +2990,22 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
     private func processAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
         guard isRecording else {
-            if rallyState != .end {
-                updateRallyState(.end)
+            if rallyStateSnapshot() != .end {
+                transitionRallyState(to: .end, playFeedback: false)
             }
             return
         }
 
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
         guard timestamp.isFinite, let level = audioPeakLevel(from: sampleBuffer) else { return }
+
+        if isAudioFeedbackMuted() {
+            smoothedAudioLevel = 0
+            audioFloorLevel = 0.01
+            lastImpactTimestamp = timestamp
+            lastAudioTimestamp = timestamp
+            return
+        }
 
         let smoothing = RallyDetectionConstants.levelSmoothingFactor
         smoothedAudioLevel = (smoothedAudioLevel * (1 - smoothing)) + (level * smoothing)
@@ -2735,15 +3024,15 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         if isImpact {
             lastImpactTimestamp = timestamp
-            if rallyState != .start {
-                updateRallyState(.start)
+            if rallyStateSnapshot() != .start {
+                transitionRallyState(to: .start, playFeedback: false)
             }
             return
         }
 
-        if rallyState == .start,
+        if rallyStateSnapshot() == .start,
            (timestamp - lastImpactTimestamp) >= RallyDetectionConstants.rallyEndSilenceWindow {
-            updateRallyState(.end)
+            transitionRallyState(to: .end, playFeedback: true)
         }
     }
 
@@ -3257,39 +3546,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             context.setStrokeColor((player.isCurrentHitter ? UIColor.systemRed : UIColor.systemGreen).cgColor)
             context.stroke(rect.insetBy(dx: 1, dy: 1))
 
-            let bubbleSize = CGSize(width: 132, height: 52)
             let labelRect = CGRect(x: rect.minX, y: max(rect.minY - 34, 8), width: 120, height: 28)
-            let bubbleOrigin = CGPoint(
-                x: min(max(rect.midX - (bubbleSize.width / 2), 12), CGFloat(width) - bubbleSize.width - 12),
-                y: max(labelRect.minY - bubbleSize.height - 10, 12)
-            )
-            let bubbleRect = CGRect(origin: bubbleOrigin, size: bubbleSize)
-            let bubblePath = UIBezierPath(roundedRect: bubbleRect, cornerRadius: 16)
-
-            let tailPath = UIBezierPath()
-            tailPath.move(to: CGPoint(x: bubbleRect.midX - 10, y: bubbleRect.maxY))
-            tailPath.addLine(to: CGPoint(x: bubbleRect.midX, y: bubbleRect.maxY + 10))
-            tailPath.addLine(to: CGPoint(x: bubbleRect.midX + 10, y: bubbleRect.maxY))
-            tailPath.close()
-
-            context.setFillColor(UIColor.white.cgColor)
-            context.addPath(bubblePath.cgPath)
-            context.fillPath()
-            context.addPath(tailPath.cgPath)
-            context.fillPath()
-
-            let bubbleTextAttributes: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 22, weight: .semibold),
-                .foregroundColor: UIColor.black
-            ]
-            drawVideoText(
-                "sample",
-                in: bubbleRect.insetBy(dx: 16, dy: 12),
-                attributes: bubbleTextAttributes,
-                context: context,
-                canvasHeight: height
-            )
-
             context.setFillColor(UIColor.systemGreen.cgColor)
             context.fill(labelRect)
 
@@ -3571,44 +3828,12 @@ final class PreviewView: UIView {
             shapeLayer.cornerRadius = 12
             overlayLayer.addSublayer(shapeLayer)
 
-            let bubbleLayer = CAShapeLayer()
-            let bubbleSize = CGSize(width: 132, height: 52)
             let labelFrame = CGRect(
                 x: convertedRect.minX,
                 y: max(convertedRect.minY - 28, 8),
                 width: 92,
                 height: 22
             )
-            let bubbleOrigin = CGPoint(
-                x: min(max(convertedRect.midX - (bubbleSize.width / 2), 12), bounds.width - bubbleSize.width - 12),
-                y: max(labelFrame.minY - bubbleSize.height - 10, 12)
-            )
-            let bubbleRect = CGRect(origin: bubbleOrigin, size: bubbleSize)
-            let bubblePath = UIBezierPath(roundedRect: bubbleRect, cornerRadius: 16)
-            bubbleLayer.path = bubblePath.cgPath
-            bubbleLayer.fillColor = UIColor.white.cgColor
-            overlayLayer.addSublayer(bubbleLayer)
-
-            let tailLayer = CAShapeLayer()
-            let tailPath = UIBezierPath()
-            tailPath.move(to: CGPoint(x: bubbleRect.midX - 10, y: bubbleRect.maxY))
-            tailPath.addLine(to: CGPoint(x: bubbleRect.midX, y: bubbleRect.maxY + 10))
-            tailPath.addLine(to: CGPoint(x: bubbleRect.midX + 10, y: bubbleRect.maxY))
-            tailPath.close()
-            tailLayer.path = tailPath.cgPath
-            tailLayer.fillColor = UIColor.white.cgColor
-            overlayLayer.addSublayer(tailLayer)
-
-            let bubbleTextLayer = CATextLayer()
-            bubbleTextLayer.string = "sample"
-            bubbleTextLayer.font = UIFont.systemFont(ofSize: 22, weight: .semibold)
-            bubbleTextLayer.fontSize = 22
-            bubbleTextLayer.alignmentMode = .center
-            bubbleTextLayer.foregroundColor = UIColor.black.cgColor
-            bubbleTextLayer.contentsScale = UIScreen.main.scale
-            bubbleTextLayer.frame = bubbleRect.insetBy(dx: 12, dy: 12)
-            overlayLayer.addSublayer(bubbleTextLayer)
-
             let textLayer = CATextLayer()
             textLayer.string = displayLabel
             textLayer.font = UIFont.boldSystemFont(ofSize: 16)
