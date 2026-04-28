@@ -1,8 +1,11 @@
 import SwiftUI
 import AVFoundation
 import AVKit
+import PhotosUI
 import UIKit
 import Vision
+import CoreTransferable
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var cameraManager = CameraManager()
@@ -695,6 +698,26 @@ struct SavedVideo: Identifiable, Hashable {
     }
 }
 
+private struct ImportedReviewVideo: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(importedContentType: .movie) { received in
+            let fileExtension = received.file.pathExtension.isEmpty ? "mov" : received.file.pathExtension
+            let temporaryURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString)
+                .appendingPathExtension(fileExtension)
+
+            if FileManager.default.fileExists(atPath: temporaryURL.path) {
+                try FileManager.default.removeItem(at: temporaryURL)
+            }
+
+            try FileManager.default.copyItem(at: received.file, to: temporaryURL)
+            return ImportedReviewVideo(url: temporaryURL)
+        }
+    }
+}
+
 struct ReviewSession {
     let video: SavedVideo
     let duration: Double
@@ -1141,6 +1164,16 @@ final class VideoLibraryManager: ObservableObject {
 
     @discardableResult
     func saveVideo(from temporaryURL: URL) -> SavedVideo? {
+        persistVideo(from: temporaryURL, preferredExtension: temporaryURL.pathExtension, copyItem: false)
+    }
+
+    @discardableResult
+    func importVideo(from sourceURL: URL) -> SavedVideo? {
+        persistVideo(from: sourceURL, preferredExtension: sourceURL.pathExtension, copyItem: true)
+    }
+
+    @discardableResult
+    private func persistVideo(from sourceURL: URL, preferredExtension: String, copyItem: Bool) -> SavedVideo? {
         let fileManager = FileManager.default
         let directory = Self.storageDirectoryURL()
 
@@ -1152,20 +1185,26 @@ final class VideoLibraryManager: ObservableObject {
 
             let finalURL = directory
                 .appendingPathComponent("TTCoach-\(formatter.string(from: Date()))")
-                .appendingPathExtension("mov")
+                .appendingPathExtension(normalizedVideoExtension(from: preferredExtension))
 
             if fileManager.fileExists(atPath: finalURL.path) {
                 try fileManager.removeItem(at: finalURL)
             }
 
-            try fileManager.moveItem(at: temporaryURL, to: finalURL)
+            if copyItem {
+                try fileManager.copyItem(at: sourceURL, to: finalURL)
+            } else {
+                try fileManager.moveItem(at: sourceURL, to: finalURL)
+            }
 
             let savedVideo = SavedVideo(url: finalURL, createdAt: Date())
             refreshVideos()
             return savedVideo
         } catch {
             print("Failed to save video: \(error)")
-            try? fileManager.removeItem(at: temporaryURL)
+            if !copyItem {
+                try? fileManager.removeItem(at: sourceURL)
+            }
             return nil
         }
     }
@@ -1212,6 +1251,11 @@ final class VideoLibraryManager: ObservableObject {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(directoryName, isDirectory: true)
     }
+
+    private func normalizedVideoExtension(from pathExtension: String) -> String {
+        let normalizedExtension = pathExtension.lowercased()
+        return ["mov", "mp4"].contains(normalizedExtension) ? normalizedExtension : "mov"
+    }
 }
 
 struct SavedVideosView: View {
@@ -1219,64 +1263,78 @@ struct SavedVideosView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var selectedVideo: SavedVideo?
     @State private var reviewingVideo: SavedVideo?
+    @State private var importedVideoItem: PhotosPickerItem?
     @State private var renamingVideo: SavedVideo?
     @State private var draftVideoName = ""
+    @State private var isImportingVideo = false
+    @State private var importErrorMessage: String?
     @State private var renameErrorMessage: String?
 
     var body: some View {
         NavigationStack {
-            Group {
-                if videoLibrary.videos.isEmpty {
-                    ContentUnavailableView(
-                        "還沒有已儲存影片",
-                        systemImage: "video.slash",
-                        description: Text("先開始一次錄影，關閉時選擇儲存，就會出現在這裡。")
-                    )
-                } else {
-                    List {
-                        ForEach(videoLibrary.videos) { video in
-                            Button {
-                                selectedVideo = video
-                            } label: {
-                                HStack(spacing: 12) {
-                                    Image(systemName: "video.fill")
-                                        .foregroundStyle(.blue)
+            ZStack {
+                Group {
+                    if videoLibrary.videos.isEmpty {
+                        ContentUnavailableView(
+                            "還沒有已儲存影片",
+                            systemImage: "video.slash",
+                            description: Text("先開始一次錄影，關閉時選擇儲存，或從右上角上傳手機裡的影片做 review。")
+                        )
+                    } else {
+                        List {
+                            ForEach(videoLibrary.videos) { video in
+                                Button {
+                                    selectedVideo = video
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "video.fill")
+                                            .foregroundStyle(.blue)
 
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(video.title)
-                                            .font(.headline)
-                                            .foregroundStyle(.primary)
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(video.title)
+                                                .font(.headline)
+                                                .foregroundStyle(.primary)
 
-                                        Text(video.createdAt.formatted(date: .abbreviated, time: .shortened))
-                                            .font(.footnote)
-                                            .foregroundStyle(.secondary)
+                                            Text(video.createdAt.formatted(date: .abbreviated, time: .shortened))
+                                                .font(.footnote)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                                .contextMenu {
+                                    Button {
+                                        reviewingVideo = video
+                                    } label: {
+                                        Label("Review", systemImage: "text.magnifyingglass")
+                                    }
+
+                                    Button {
+                                        renamingVideo = video
+                                        draftVideoName = video.title
+                                    } label: {
+                                        Label("重新命名", systemImage: "pencil")
+                                    }
+
+                                    Button(role: .destructive) {
+                                        videoLibrary.deleteVideo(video)
+                                    } label: {
+                                        Label("刪除", systemImage: "trash")
                                     }
                                 }
                             }
-                            .contextMenu {
-                                Button {
-                                    reviewingVideo = video
-                                } label: {
-                                    Label("Review", systemImage: "text.magnifyingglass")
-                                }
-
-                                Button {
-                                    renamingVideo = video
-                                    draftVideoName = video.title
-                                } label: {
-                                    Label("重新命名", systemImage: "pencil")
-                                }
-
-                                Button(role: .destructive) {
-                                    videoLibrary.deleteVideo(video)
-                                } label: {
-                                    Label("刪除", systemImage: "trash")
-                                }
-                            }
+                            .onDelete(perform: videoLibrary.deleteVideos)
                         }
-                        .onDelete(perform: videoLibrary.deleteVideos)
+                        .listStyle(.plain)
                     }
-                    .listStyle(.plain)
+                }
+
+                if isImportingVideo {
+                    Color.black.opacity(0.32)
+                        .ignoresSafeArea()
+
+                    ProgressView("匯入影片中...")
+                        .padding(24)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
                 }
             }
             .navigationTitle("已儲存影片")
@@ -1287,12 +1345,18 @@ struct SavedVideosView: View {
                     }
                 }
 
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    PhotosPicker(selection: $importedVideoItem, matching: .videos) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .disabled(isImportingVideo)
+
                     Button {
                         videoLibrary.refreshVideos()
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
+                    .disabled(isImportingVideo)
                 }
             }
             .sheet(item: $selectedVideo) { video in
@@ -1328,6 +1392,22 @@ struct SavedVideosView: View {
             } message: {
                 Text("輸入新的影片名稱")
             }
+            .task(id: importedVideoItem) {
+                guard let importedVideoItem else { return }
+                await importSelectedVideo(from: importedVideoItem)
+            }
+            .alert("無法匯入影片", isPresented: Binding(
+                get: { importErrorMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        importErrorMessage = nil
+                    }
+                }
+            )) {
+                Button("確定", role: .cancel) { }
+            } message: {
+                Text(importErrorMessage ?? "")
+            }
             .alert("無法重新命名", isPresented: Binding(
                 get: { renameErrorMessage != nil },
                 set: { isPresented in
@@ -1339,6 +1419,53 @@ struct SavedVideosView: View {
                 Button("確定", role: .cancel) { }
             } message: {
                 Text(renameErrorMessage ?? "")
+            }
+        }
+    }
+
+    @MainActor
+    private func finishVideoImport(with savedVideo: SavedVideo?) {
+        isImportingVideo = false
+        importedVideoItem = nil
+
+        guard let savedVideo else {
+            importErrorMessage = "影片已選取，但匯入到 app 失敗。"
+            return
+        }
+
+        reviewingVideo = savedVideo
+    }
+
+    private func importSelectedVideo(from item: PhotosPickerItem) async {
+        await MainActor.run {
+            guard !isImportingVideo else { return }
+            isImportingVideo = true
+            importErrorMessage = nil
+        }
+
+        do {
+            guard let importedVideo = try await item.loadTransferable(type: ImportedReviewVideo.self) else {
+                await MainActor.run {
+                    isImportingVideo = false
+                    importedVideoItem = nil
+                    importErrorMessage = "選取的影片無法讀取。"
+                }
+                return
+            }
+
+            let savedVideo = await MainActor.run {
+                videoLibrary.importVideo(from: importedVideo.url)
+            }
+            try? FileManager.default.removeItem(at: importedVideo.url)
+
+            await MainActor.run {
+                finishVideoImport(with: savedVideo)
+            }
+        } catch {
+            await MainActor.run {
+                isImportingVideo = false
+                importedVideoItem = nil
+                importErrorMessage = "影片匯入失敗：\(error.localizedDescription)"
             }
         }
     }
@@ -1596,6 +1723,8 @@ struct VideoReviewScreen: View {
     @State private var duration: Double = 0
     @State private var isSeeking = false
     @State private var isPlaying = false
+    @State private var isCourtMapPresented = false
+    @State private var selectedReviewEvent: MovementEvent?
     @State private var timeObserver: Any?
 
     var body: some View {
@@ -1622,12 +1751,6 @@ struct VideoReviewScreen: View {
                             if let currentFrame = currentReviewFrame {
                                 ReviewFrameSummary(frame: currentFrame)
                             }
-
-                            if let activeSuggestion {
-                                ActiveReviewSuggestionCard(suggestion: activeSuggestion)
-                            } else if let activeEvent {
-                                ActiveMovementEventCard(event: activeEvent)
-                            }
                         }
                         .padding(16)
                     }
@@ -1635,8 +1758,9 @@ struct VideoReviewScreen: View {
                     reviewPlaybackControls
 
                     if let session {
-                        reviewSummary(session: session)
+                        activeReviewInsight()
                         reviewTimeline(session: session)
+                        reviewSummary(session: session)
                         reviewSuggestionList(session: session)
                         reviewEventList(session: session)
                         reviewTrackPreview(session: session)
@@ -1653,10 +1777,26 @@ struct VideoReviewScreen: View {
             .navigationTitle("影片 Review")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        isCourtMapPresented = true
+                    } label: {
+                        Image(systemName: "map")
+                    }
+                    .disabled(session == nil)
+
                     Button("完成") {
                         dismiss()
                     }
+                }
+            }
+            .sheet(isPresented: $isCourtMapPresented) {
+                if let session {
+                    ReviewCourtMapScreen(
+                        session: session,
+                        currentTime: $currentTime,
+                        selectedEvent: selectedMapEvent
+                    )
                 }
             }
             .task {
@@ -1681,6 +1821,24 @@ struct VideoReviewScreen: View {
 
     private var activeSuggestion: ReviewSuggestion? {
         session?.suggestions.first(where: { currentTime >= $0.timeRange.lowerBound && currentTime <= $0.timeRange.upperBound })
+    }
+
+    private var selectedMapEvent: MovementEvent? {
+        if let selectedReviewEvent {
+            return selectedReviewEvent
+        }
+        return activeEvent
+    }
+
+    @ViewBuilder
+    private func activeReviewInsight() -> some View {
+        if let activeSuggestion {
+            ActiveReviewSuggestionCard(suggestion: activeSuggestion)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else if let activeEvent {
+            ActiveMovementEventCard(event: activeEvent)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 
     private var reviewPlaybackControls: some View {
@@ -1842,6 +2000,7 @@ struct VideoReviewScreen: View {
 
             ForEach(session.suggestions) { suggestion in
                 Button {
+                    selectedReviewEvent = matchedEvent(for: suggestion)
                     currentTime = suggestion.timeRange.lowerBound
                     seekReview(to: suggestion.timeRange.lowerBound)
                 } label: {
@@ -1958,8 +2117,17 @@ struct VideoReviewScreen: View {
     }
 
     private func seekToEvent(_ event: MovementEvent) {
+        selectedReviewEvent = event
         currentTime = event.startTime
         seekReview(to: event.startTime)
+    }
+
+    private func matchedEvent(for suggestion: ReviewSuggestion) -> MovementEvent? {
+        session?.movementEvents.first(where: { event in
+            event.kind == suggestion.eventKind &&
+            event.startTime <= suggestion.timeRange.upperBound &&
+            event.endTime >= suggestion.timeRange.lowerBound
+        })
     }
 
     private func toggleReviewPlayback() {
@@ -2160,6 +2328,303 @@ struct ReviewTimelineView: View {
                 }
             }
         }
+    }
+}
+
+struct ReviewCourtMapScreen: View {
+    let session: ReviewSession
+    @Binding var currentTime: Double
+    let selectedEvent: MovementEvent?
+
+    @Environment(\.dismiss) private var dismiss
+
+    private enum MapConstants {
+        static let recentTrailDuration: Double = 1.5
+    }
+
+    private var currentFrame: PlayerTrackFrame? {
+        guard !session.trackFrames.isEmpty else { return nil }
+        return session.trackFrames.min(by: { abs($0.time - currentTime) < abs($1.time - currentTime) })
+    }
+
+    private var displayedTrailFrames: [PlayerTrackFrame] {
+        if let selectedEvent {
+            return session.trackFrames.filter { frame in
+                frame.time >= selectedEvent.startTime && frame.time <= selectedEvent.endTime
+            }
+        }
+
+        let trailStart = max(currentTime - MapConstants.recentTrailDuration, 0)
+        return session.trackFrames.filter { frame in
+            frame.time >= trailStart && frame.time <= currentTime
+        }
+    }
+
+    private var modeTitle: String {
+        selectedEvent == nil ? "Live Position + Recent Trails" : "Selected Rally Trajectory"
+    }
+
+    private var modeDetail: String {
+        if let selectedEvent {
+            return "\(selectedEvent.title) · \(timeString(selectedEvent.startTime)) - \(timeString(selectedEvent.endTime))"
+        }
+        return "Closest analyzed frame at \(timeString(currentTime)) with the last 1.5 seconds of movement."
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    ReviewCourtMapView(
+                        currentFrame: currentFrame,
+                        trailFrames: displayedTrailFrames,
+                        selectedEvent: selectedEvent
+                    )
+                    .frame(maxWidth: .infinity)
+                    .aspectRatio(0.9, contentMode: .fit)
+
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(modeTitle)
+                            .font(.headline)
+
+                        Text(modeDetail)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(18)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+
+                    HStack(spacing: 12) {
+                        CourtMapLegendChip(label: "Player1", color: .blue)
+                        CourtMapLegendChip(label: "Player2", color: .orange)
+                        Spacer()
+                    }
+
+                    Text("Top edge = closer to the table. Positions come from each player bounding box foot point mapped into the normalized player-area coordinates.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(20)
+            }
+            .background(Color(.systemBackground))
+            .navigationTitle("2D Court Map")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+
+    private func timeString(_ seconds: Double) -> String {
+        let totalSeconds = max(Int(seconds.rounded(.down)), 0)
+        let minutes = totalSeconds / 60
+        let remainingSeconds = totalSeconds % 60
+        return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+}
+
+struct ReviewCourtMapView: View {
+    let currentFrame: PlayerTrackFrame?
+    let trailFrames: [PlayerTrackFrame]
+    let selectedEvent: MovementEvent?
+
+    private let playerColors: [String: Color] = [
+        "Player1": .blue,
+        "Player2": .orange
+    ]
+
+    var body: some View {
+        GeometryReader { geometry in
+            let viewBounds = CGRect(origin: .zero, size: geometry.size)
+            let outerRect = viewBounds.insetBy(dx: 18, dy: 18)
+            let tableRect = CGRect(
+                x: outerRect.minX + (outerRect.width * 0.12),
+                y: outerRect.minY + 22,
+                width: outerRect.width * 0.76,
+                height: outerRect.height * 0.2
+            )
+            let playerZoneRect = CGRect(
+                x: outerRect.minX + (outerRect.width * 0.08),
+                y: tableRect.maxY + 26,
+                width: outerRect.width * 0.84,
+                height: outerRect.maxY - tableRect.maxY - 44
+            )
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 28)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.17, green: 0.38, blue: 0.28),
+                                Color(red: 0.09, green: 0.21, blue: 0.15)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+
+                RoundedRectangle(cornerRadius: 28)
+                    .stroke(Color.black.opacity(0.18), lineWidth: 2)
+
+                RoundedRectangle(cornerRadius: 20)
+                    .fill(Color(red: 0.23, green: 0.48, blue: 0.82))
+                    .frame(width: tableRect.width, height: tableRect.height)
+                    .position(x: tableRect.midX, y: tableRect.midY)
+
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(Color.white.opacity(0.85), lineWidth: 2)
+                    .frame(width: tableRect.width, height: tableRect.height)
+                    .position(x: tableRect.midX, y: tableRect.midY)
+
+                Path { path in
+                    path.move(to: CGPoint(x: tableRect.midX, y: tableRect.minY))
+                    path.addLine(to: CGPoint(x: tableRect.midX, y: tableRect.maxY))
+                }
+                .stroke(Color.white.opacity(0.95), lineWidth: 2)
+
+                Capsule()
+                    .fill(Color.white.opacity(0.95))
+                    .frame(width: tableRect.width + 18, height: 8)
+                    .position(x: tableRect.midX, y: tableRect.maxY + 3)
+
+                Text("Table")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.95))
+                    .position(x: tableRect.midX, y: tableRect.minY - 4)
+
+                RoundedRectangle(cornerRadius: 24)
+                    .fill(Color.white.opacity(0.08))
+                    .frame(width: playerZoneRect.width, height: playerZoneRect.height)
+                    .position(x: playerZoneRect.midX, y: playerZoneRect.midY)
+
+                RoundedRectangle(cornerRadius: 24)
+                    .stroke(Color.white.opacity(0.28), style: StrokeStyle(lineWidth: 1.5, dash: [8, 6]))
+                    .frame(width: playerZoneRect.width, height: playerZoneRect.height)
+                    .position(x: playerZoneRect.midX, y: playerZoneRect.midY)
+
+                Path { path in
+                    path.move(to: CGPoint(x: playerZoneRect.midX, y: playerZoneRect.minY))
+                    path.addLine(to: CGPoint(x: playerZoneRect.midX, y: playerZoneRect.maxY))
+
+                    path.move(to: CGPoint(x: playerZoneRect.minX, y: playerZoneRect.minY + (playerZoneRect.height * 0.33)))
+                    path.addLine(to: CGPoint(x: playerZoneRect.maxX, y: playerZoneRect.minY + (playerZoneRect.height * 0.33)))
+
+                    path.move(to: CGPoint(x: playerZoneRect.minX, y: playerZoneRect.minY + (playerZoneRect.height * 0.66)))
+                    path.addLine(to: CGPoint(x: playerZoneRect.maxX, y: playerZoneRect.minY + (playerZoneRect.height * 0.66)))
+                }
+                .stroke(Color.white.opacity(0.2), style: StrokeStyle(lineWidth: 1.25, dash: [6, 6]))
+
+                Text("Player Movement Zone")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.92))
+                    .position(x: playerZoneRect.midX, y: playerZoneRect.maxY + 16)
+
+                ForEach(["Player1", "Player2"], id: \.self) { playerID in
+                    let trailPath = playerTrailPath(for: playerID, in: playerZoneRect)
+                    trailPath
+                        .stroke(
+                            playerColors[playerID, default: .gray].opacity(selectedEvent == nil ? 0.5 : 0.85),
+                            style: StrokeStyle(
+                                lineWidth: selectedEvent == nil ? 4 : 5,
+                                lineCap: .round,
+                                lineJoin: .round
+                            )
+                        )
+                }
+
+                ForEach(currentPlayers, id: \.id) { player in
+                    if let point = player.playerAreaPoint {
+                        let position = mappedPosition(for: point, in: playerZoneRect)
+
+                        Circle()
+                            .fill(playerColor(for: player))
+                            .frame(width: 18, height: 18)
+                            .overlay {
+                                Circle()
+                                    .stroke(Color.white, lineWidth: 3)
+                            }
+                            .position(position)
+
+                        Text(player.label)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(playerColor(for: player), in: Capsule())
+                            .position(
+                                x: position.x,
+                                y: max(playerZoneRect.minY + 16, position.y - 24)
+                            )
+                    }
+                }
+            }
+            .frame(width: geometry.size.width, height: geometry.size.height)
+            .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 28))
+            .animation(.linear(duration: 0.12), value: currentPlayers)
+            .animation(.linear(duration: 0.12), value: trailFrames)
+        }
+    }
+
+    private var currentPlayers: [TrackedPlayerBox] {
+        currentFrame?.players.filter { $0.playerAreaPoint != nil } ?? []
+    }
+
+    private func playerColor(for player: TrackedPlayerBox) -> Color {
+        playerColors[player.id, default: .gray]
+    }
+
+    private func playerTrailPath(for playerID: String, in rect: CGRect) -> Path {
+        let points = trailFrames.compactMap { frame -> CGPoint? in
+            guard
+                let player = frame.players.first(where: { $0.id == playerID }),
+                let playerAreaPoint = player.playerAreaPoint
+            else {
+                return nil
+            }
+
+            return mappedPosition(for: playerAreaPoint, in: rect)
+        }
+
+        var path = Path()
+        guard let firstPoint = points.first else { return path }
+
+        path.move(to: firstPoint)
+        for point in points.dropFirst() {
+            path.addLine(to: point)
+        }
+
+        return path
+    }
+
+    private func mappedPosition(for point: CGPoint, in rect: CGRect) -> CGPoint {
+        CGPoint(
+            x: rect.minX + (point.x * rect.width),
+            y: rect.minY + (point.y * rect.height)
+        )
+    }
+}
+
+struct CourtMapLegendChip: View {
+    let label: String
+    let color: Color
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(color)
+                .frame(width: 12, height: 12)
+            Text(label)
+                .font(.footnote.weight(.semibold))
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(color.opacity(0.12), in: Capsule())
     }
 }
 
