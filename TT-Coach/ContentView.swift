@@ -7,9 +7,35 @@ import Vision
 import CoreTransferable
 import UniformTypeIdentifiers
 
+private enum AppLanguage: String, CaseIterable {
+    case chinese = "zh-Hans"
+    case english = "en"
+
+    var displayName: String {
+        switch self {
+        case .chinese:
+            return "中文"
+        case .english:
+            return "English"
+        }
+    }
+}
+
+private let appLanguageStorageKey = "appLanguage"
+
+private func localized(_ language: AppLanguage, zh: String, en: String) -> String {
+    switch language {
+    case .chinese:
+        return zh
+    case .english:
+        return en
+    }
+}
+
 struct ContentView: View {
     @StateObject private var cameraManager = CameraManager()
     @StateObject private var videoLibrary = VideoLibraryManager()
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
 
     @State private var isCoachingMode = false
     @State private var permissionMessage: String?
@@ -18,6 +44,11 @@ struct ContentView: View {
     @State private var showSaveRecordingDialog = false
     @State private var isWaitingForLandscapeRecording = false
     @State private var calibrationPoints: [CGPoint] = []
+    @State private var showLanguagePicker = false
+
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
 
     var body: some View {
         ZStack {
@@ -31,13 +62,14 @@ struct ContentView: View {
                 Color.black.opacity(0.35)
                     .ignoresSafeArea()
 
-                ProgressView("處理錄影中...")
+                ProgressView(localized(appLanguage, zh: "處理錄影中...", en: "Processing recording..."))
                     .padding(24)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
                     .foregroundStyle(.white)
             }
         }
-        .alert("無法開啟相機", isPresented: Binding(
+        .environment(\.locale, Locale(identifier: appLanguage.rawValue))
+        .alert(localized(appLanguage, zh: "無法開啟相機", en: "Unable to Open Camera"), isPresented: Binding(
             get: { permissionMessage != nil },
             set: { isPresented in
                 if !isPresented {
@@ -45,22 +77,31 @@ struct ContentView: View {
                 }
             }
         )) {
-            Button("確定", role: .cancel) { }
+            Button(localized(appLanguage, zh: "確定", en: "OK"), role: .cancel) { }
         } message: {
             Text(permissionMessage ?? "")
         }
-        .confirmationDialog("是否儲存本次錄影？", isPresented: $showSaveRecordingDialog, titleVisibility: .visible) {
-            Button("儲存") {
+        .confirmationDialog(localized(appLanguage, zh: "是否儲存本次錄影？", en: "Save this recording?"), isPresented: $showSaveRecordingDialog, titleVisibility: .visible) {
+            Button(localized(appLanguage, zh: "儲存", en: "Save")) {
                 closeCoachingMode(saveRecording: true)
             }
 
-            Button("不儲存", role: .destructive) {
+            Button(localized(appLanguage, zh: "不儲存", en: "Don't Save"), role: .destructive) {
                 closeCoachingMode(saveRecording: false)
             }
 
-            Button("取消", role: .cancel) { }
+            Button(localized(appLanguage, zh: "取消", en: "Cancel"), role: .cancel) { }
         } message: {
-            Text("關閉教練模式前，選擇是否保留剛剛錄下的影片。")
+            Text(localized(appLanguage, zh: "關閉教練模式前，選擇是否保留剛剛錄下的影片。", en: "Choose whether to keep the video you just recorded before leaving coaching mode."))
+        }
+        .confirmationDialog(localized(appLanguage, zh: "選擇語言", en: "Choose Language"), isPresented: $showLanguagePicker, titleVisibility: .visible) {
+            ForEach(AppLanguage.allCases, id: \.rawValue) { language in
+                Button(language.displayName) {
+                    appLanguageRawValue = language.rawValue
+                }
+            }
+
+            Button(localized(appLanguage, zh: "取消", en: "Cancel"), role: .cancel) { }
         }
         .sheet(isPresented: $isVideoLibraryPresented) {
             SavedVideosView(videoLibrary: videoLibrary)
@@ -76,13 +117,30 @@ struct ContentView: View {
         .ignoresSafeArea()
         .overlay {
             VStack(spacing: 24) {
+                HStack {
+                    Spacer()
+
+                    Button {
+                        showLanguagePicker = true
+                    } label: {
+                        Image(systemName: "globe")
+                            .font(.system(size: 18, weight: .semibold))
+                            .frame(width: 42, height: 42)
+                            .background(Color.white.opacity(0.14))
+                            .foregroundStyle(.white)
+                            .clipShape(Circle())
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
+
                 Spacer()
 
                 Text("TT-Coach")
                     .font(.system(size: 40, weight: .bold))
                     .foregroundColor(.white)
 
-                Text("Table Tennis Doubles Audio Coach")
+                Text(localized(appLanguage, zh: "桌球雙打語音教練", en: "Table Tennis Doubles Audio Coach"))
                     .font(.title3)
                     .foregroundColor(.white.opacity(0.85))
 
@@ -94,11 +152,11 @@ struct ContentView: View {
                         if started {
                             isCoachingMode = true
                         } else {
-                            permissionMessage = "請先允許相機與麥克風權限，才能進入 AI 教練模式。"
+                            permissionMessage = localized(appLanguage, zh: "請先允許相機與麥克風權限，才能進入 AI 教練模式。", en: "Please allow camera and microphone access before entering AI coaching mode.")
                         }
                     }
                 } label: {
-                    Text("開始")
+                    Text(localized(appLanguage, zh: "開始", en: "Start"))
                         .font(.title2.bold())
                         .frame(maxWidth: .infinity)
                         .padding()
@@ -112,7 +170,7 @@ struct ContentView: View {
                     videoLibrary.refreshVideos()
                     isVideoLibraryPresented = true
                 } label: {
-                    Label("已儲存影片", systemImage: "film.stack")
+                    Label(localized(appLanguage, zh: "已儲存影片", en: "Saved Videos"), systemImage: "film.stack")
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding()
@@ -122,7 +180,7 @@ struct ContentView: View {
                 }
                 .padding(.horizontal, 32)
 
-                Text("按下開始後會開啟相機、進入 AI 教練模式；若手機直放，會提示先橫放再開始錄影")
+                Text(localized(appLanguage, zh: "按下開始後會開啟相機、進入 AI 教練模式；若手機直放，會提示先橫放再開始錄影", en: "Tap Start to open the camera and enter AI coaching mode. If the phone is vertical, the app will ask you to rotate to landscape before recording starts."))
                     .font(.footnote)
                     .foregroundColor(.white.opacity(0.75))
                     .padding(.bottom, 40)
@@ -164,7 +222,7 @@ struct ContentView: View {
                                 Button {
                                     resetCalibration()
                                 } label: {
-                                    Label("重設標定", systemImage: "arrow.counterclockwise")
+                                    Label(localized(appLanguage, zh: "重設標定", en: "Reset Calibration"), systemImage: "arrow.counterclockwise")
                                         .font(.subheadline.weight(.semibold))
                                         .padding(.horizontal, 12)
                                         .padding(.vertical, 8)
@@ -207,11 +265,11 @@ struct ContentView: View {
                         Spacer()
 
                         VStack(spacing: 10) {
-                            Text("請把手機水平放置")
+                            Text(localized(appLanguage, zh: "請把手機水平放置", en: "Rotate Phone to Landscape"))
                                 .font(.title3.weight(.bold))
                                 .foregroundStyle(.white)
 
-                            Text("偵測到目前是直式，轉成橫式後會自動開始錄影。")
+                            Text(localized(appLanguage, zh: "偵測到目前是直式，轉成橫式後會自動開始錄影。", en: "Portrait orientation detected. Recording will start automatically after you rotate to landscape."))
                                 .font(.subheadline)
                                 .multilineTextAlignment(.center)
                                 .foregroundStyle(.white.opacity(0.9))
@@ -233,6 +291,7 @@ struct ContentView: View {
                             .padding(.horizontal, 24)
                             .padding(.bottom, max(bottomPadding + 16, 32))
                     }
+                    .allowsHitTesting(false)
                 }
             }
             .onAppear {
@@ -307,7 +366,9 @@ struct ContentView: View {
     }
 
     private var calibrationStatusLabel: String {
-        isCalibrationComplete ? "已標定" : "第 \(calibrationPoints.count)/4 點"
+        isCalibrationComplete
+            ? localized(appLanguage, zh: "已標定", en: "Calibrated")
+            : localized(appLanguage, zh: "第 \(calibrationPoints.count)/4 點", en: "Point \(calibrationPoints.count)/4")
     }
 
     private var recordingBadgeLabel: String {
@@ -315,12 +376,12 @@ struct ContentView: View {
             return "REC"
         }
         if isWaitingForLandscapeRecording {
-            return "等待橫放"
+            return localized(appLanguage, zh: "等待橫放", en: "Waiting for Landscape")
         }
         if !isCalibrationComplete {
-            return "等待標定"
+            return localized(appLanguage, zh: "等待標定", en: "Waiting for Calibration")
         }
-        return "待命"
+        return localized(appLanguage, zh: "待命", en: "Standby")
     }
 
     private var recordingBadgeColor: Color {
@@ -332,16 +393,16 @@ struct ContentView: View {
 
     private var calibrationHeadline: String {
         if let nextCorner = CalibrationCorner(rawValue: calibrationPoints.count) {
-            return "請點選跑動區域的\(nextCorner.title)"
+            return localized(appLanguage, zh: "請點選跑動區域的\(nextCorner.title(in: appLanguage))", en: "Tap the \(nextCorner.title(in: appLanguage)) corner of the movement zone")
         }
-        return "跑動區域標定完成"
+        return localized(appLanguage, zh: "跑動區域標定完成", en: "Movement Zone Calibration Complete")
     }
 
     private var calibrationDetail: String {
         if isCalibrationComplete {
-            return "已建立 normalized 跑動區域座標，可開始錄影。"
+            return localized(appLanguage, zh: "已建立 normalized 跑動區域座標，可開始錄影。", en: "Normalized movement-zone coordinates are ready. Recording can start.")
         }
-        return "依序點選左上、右上、右下、左下四個角，系統會用這個區域估算球員左右、前後與站位漏洞。"
+        return localized(appLanguage, zh: "依序點選左上、右上、右下、左下四個角，系統會用這個區域估算球員左右、前後與站位漏洞。", en: "Tap the top-left, top-right, bottom-right, and bottom-left corners in order. The app uses this area to estimate left-right spacing, front-back depth, and positioning gaps.")
     }
 
     private func syncRecordingState(forLandscape isLandscape: Bool) {
@@ -464,6 +525,47 @@ struct TrackedPlayerBox: Identifiable, Equatable, Hashable {
     }
 }
 
+private func cameraProximityScore(for boundingBox: CGRect) -> CGFloat {
+    let areaScore = boundingBox.width * boundingBox.height
+    return areaScore + (boundingBox.height * 0.1)
+}
+
+private func normalizedPlayerFootPoint(for boundingBox: CGRect) -> CGPoint {
+    CGPoint(
+        x: min(max(boundingBox.midX, 0), 1),
+        y: min(max(1 - boundingBox.minY, 0), 1)
+    )
+}
+
+private func fallbackCourtMapPoint(for boundingBox: CGRect) -> CGPoint {
+    let footPoint = normalizedPlayerFootPoint(for: boundingBox)
+
+    // Review-mode videos do not have a calibrated player-area homography, so
+    // apply a simple perspective compensation to place players closer to the
+    // table when they appear higher in the camera frame.
+    let adjustedDepth = pow(footPoint.y, 2.35)
+    return CGPoint(
+        x: footPoint.x,
+        y: min(max(adjustedDepth, 0), 1)
+    )
+}
+
+private func selectNearestTwoPlayerBoxes(from boundingBoxes: [CGRect]) -> [CGRect] {
+    Array(
+        boundingBoxes
+            .sorted { lhs, rhs in
+                let lhsScore = cameraProximityScore(for: lhs)
+                let rhsScore = cameraProximityScore(for: rhs)
+                if lhsScore == rhsScore {
+                    return lhs.midX < rhs.midX
+                }
+                return lhsScore > rhsScore
+            }
+            .prefix(2)
+            .sorted { $0.midX < $1.midX }
+    )
+}
+
 struct TrackingDebugInfo {
     var source = "none"
     var rectangleCandidates = 0
@@ -554,16 +656,16 @@ enum CalibrationCorner: Int, CaseIterable {
     case bottomRight
     case bottomLeft
 
-    var title: String {
+    fileprivate func title(in language: AppLanguage) -> String {
         switch self {
         case .topLeft:
-            return "左上角"
+            return localized(language, zh: "左上", en: "top-left")
         case .topRight:
-            return "右上角"
+            return localized(language, zh: "右上", en: "top-right")
         case .bottomRight:
-            return "右下角"
+            return localized(language, zh: "右下", en: "bottom-right")
         case .bottomLeft:
-            return "左下角"
+            return localized(language, zh: "左下", en: "bottom-left")
         }
     }
 }
@@ -732,6 +834,74 @@ struct PlayerTrackFrame: Identifiable, Hashable {
     let players: [TrackedPlayerBox]
 }
 
+private struct CourtMapJumpFilterState {
+    var acceptedPoint: CGPoint
+    var pendingPoint: CGPoint?
+    var pendingCount = 0
+}
+
+private func filteredCourtMapFrames(from frames: [PlayerTrackFrame]) -> [PlayerTrackFrame] {
+    var filterStates: [String: CourtMapJumpFilterState] = [:]
+
+    return frames.map { frame in
+        let filteredPlayers = frame.players.map { player in
+            guard let point = player.playerAreaPoint else { return player }
+
+            let filteredPoint: CGPoint
+            if var state = filterStates[player.id] {
+                let jumpDistance = hypot(point.x - state.acceptedPoint.x, point.y - state.acceptedPoint.y)
+                if jumpDistance <= 0.24 {
+                    state.acceptedPoint = point
+                    state.pendingPoint = nil
+                    state.pendingCount = 0
+                    filteredPoint = point
+                } else if let pendingPoint = state.pendingPoint {
+                    let pendingDistance = hypot(point.x - pendingPoint.x, point.y - pendingPoint.y)
+                    if pendingDistance <= 0.08 {
+                        state.pendingCount += 1
+                        if state.pendingCount >= 2 {
+                            state.acceptedPoint = CGPoint(
+                                x: (pendingPoint.x + point.x) / 2,
+                                y: (pendingPoint.y + point.y) / 2
+                            )
+                            state.pendingPoint = nil
+                            state.pendingCount = 0
+                            filteredPoint = state.acceptedPoint
+                        } else {
+                            filteredPoint = state.acceptedPoint
+                        }
+                    } else {
+                        state.pendingPoint = point
+                        state.pendingCount = 1
+                        filteredPoint = state.acceptedPoint
+                    }
+                } else {
+                    state.pendingPoint = point
+                    state.pendingCount = 1
+                    filteredPoint = state.acceptedPoint
+                }
+                filterStates[player.id] = state
+            } else {
+                filterStates[player.id] = CourtMapJumpFilterState(acceptedPoint: point)
+                filteredPoint = point
+            }
+
+            return TrackedPlayerBox(
+                id: player.id,
+                label: player.label,
+                boundingBox: player.boundingBox,
+                footPoint: player.footPoint,
+                playerAreaPoint: filteredPoint,
+                lateralPosition: player.lateralPosition,
+                depthPosition: player.depthPosition,
+                isCurrentHitter: player.isCurrentHitter
+            )
+        }
+
+        return PlayerTrackFrame(time: frame.time, players: filteredPlayers)
+    }
+}
+
 struct MovementEvent: Identifiable, Hashable {
     enum Kind: String, Hashable {
         case closeSpacing
@@ -855,13 +1025,21 @@ enum VideoReviewAnalyzer {
             let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .up, options: [:])
             try handler.perform([request])
 
-            let observations = Array((request.results ?? [])
-                .sorted { $0.boundingBox.midX < $1.boundingBox.midX }
-                .prefix(2))
+            let selectedBoxes = selectNearestTwoPlayerBoxes(
+                from: (request.results ?? []).map(\.boundingBox)
+            )
 
-            let detectedPlayers = observations.enumerated().map { index, observation in
+            let detectedPlayers = selectedBoxes.enumerated().map { index, boundingBox in
                 let label = index == 0 ? "Player1" : "Player2"
-                return TrackedPlayerBox(id: label, label: label, boundingBox: observation.boundingBox)
+                let footPoint = normalizedPlayerFootPoint(for: boundingBox)
+                let courtMapPoint = fallbackCourtMapPoint(for: boundingBox)
+                return TrackedPlayerBox(
+                    id: label,
+                    label: label,
+                    boundingBox: boundingBox,
+                    footPoint: footPoint,
+                    playerAreaPoint: courtMapPoint
+                )
             }
 
             guard previousPlayers.count == 2, detectedPlayers.count == 2 else {
@@ -1261,6 +1439,7 @@ final class VideoLibraryManager: ObservableObject {
 struct SavedVideosView: View {
     @ObservedObject var videoLibrary: VideoLibraryManager
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
     @State private var selectedVideo: SavedVideo?
     @State private var reviewingVideo: SavedVideo?
     @State private var importedVideoItem: PhotosPickerItem?
@@ -1270,15 +1449,19 @@ struct SavedVideosView: View {
     @State private var importErrorMessage: String?
     @State private var renameErrorMessage: String?
 
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
                 Group {
                     if videoLibrary.videos.isEmpty {
                         ContentUnavailableView(
-                            "還沒有已儲存影片",
+                            localized(appLanguage, zh: "還沒有已儲存影片", en: "No Saved Videos Yet"),
                             systemImage: "video.slash",
-                            description: Text("先開始一次錄影，關閉時選擇儲存，或從右上角上傳手機裡的影片做 review。")
+                            description: Text(localized(appLanguage, zh: "先開始一次錄影，關閉時選擇儲存，或從右上角上傳手機裡的影片做 review。", en: "Record a session and save it when closing, or import a video from your phone using the top-right button for review."))
                         )
                     } else {
                         List {
@@ -1305,20 +1488,20 @@ struct SavedVideosView: View {
                                     Button {
                                         reviewingVideo = video
                                     } label: {
-                                        Label("Review", systemImage: "text.magnifyingglass")
+                                        Label(localized(appLanguage, zh: "分析", en: "Review"), systemImage: "text.magnifyingglass")
                                     }
 
                                     Button {
                                         renamingVideo = video
                                         draftVideoName = video.title
                                     } label: {
-                                        Label("重新命名", systemImage: "pencil")
+                                        Label(localized(appLanguage, zh: "重新命名", en: "Rename"), systemImage: "pencil")
                                     }
 
                                     Button(role: .destructive) {
                                         videoLibrary.deleteVideo(video)
                                     } label: {
-                                        Label("刪除", systemImage: "trash")
+                                        Label(localized(appLanguage, zh: "刪除", en: "Delete"), systemImage: "trash")
                                     }
                                 }
                             }
@@ -1332,15 +1515,15 @@ struct SavedVideosView: View {
                     Color.black.opacity(0.32)
                         .ignoresSafeArea()
 
-                    ProgressView("匯入影片中...")
+                    ProgressView(localized(appLanguage, zh: "匯入影片中...", en: "Importing Video..."))
                         .padding(24)
                         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
                 }
             }
-            .navigationTitle("已儲存影片")
+            .navigationTitle(localized(appLanguage, zh: "已儲存影片", en: "Saved Videos"))
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("關閉") {
+                    Button(localized(appLanguage, zh: "關閉", en: "Close")) {
                         dismiss()
                     }
                 }
@@ -1365,7 +1548,7 @@ struct SavedVideosView: View {
             .sheet(item: $reviewingVideo) { video in
                 VideoReviewScreen(video: video)
             }
-            .alert("重新命名影片", isPresented: Binding(
+            .alert(localized(appLanguage, zh: "重新命名影片", en: "Rename Video"), isPresented: Binding(
                 get: { renamingVideo != nil },
                 set: { isPresented in
                     if !isPresented {
@@ -1374,29 +1557,29 @@ struct SavedVideosView: View {
                     }
                 }
             )) {
-                TextField("影片名稱", text: $draftVideoName)
+                TextField(localized(appLanguage, zh: "影片名稱", en: "Video Name"), text: $draftVideoName)
 
-                Button("取消", role: .cancel) { }
+                Button(localized(appLanguage, zh: "取消", en: "Cancel"), role: .cancel) { }
 
-                Button("儲存") {
+                Button(localized(appLanguage, zh: "儲存", en: "Save")) {
                     guard let renamingVideo else { return }
 
                     let didRename = videoLibrary.renameVideo(renamingVideo, to: draftVideoName)
                     if !didRename {
-                        renameErrorMessage = "重新命名失敗。請確認名稱不是空白，且沒有和其他影片重複。"
+                        renameErrorMessage = localized(appLanguage, zh: "重新命名失敗。請確認名稱不是空白，且沒有和其他影片重複。", en: "Rename failed. Make sure the name is not empty and does not duplicate another video.")
                     }
 
                     self.renamingVideo = nil
                     draftVideoName = ""
                 }
             } message: {
-                Text("輸入新的影片名稱")
+                Text(localized(appLanguage, zh: "輸入新的影片名稱", en: "Enter a new video name"))
             }
             .task(id: importedVideoItem) {
                 guard let importedVideoItem else { return }
                 await importSelectedVideo(from: importedVideoItem)
             }
-            .alert("無法匯入影片", isPresented: Binding(
+            .alert(localized(appLanguage, zh: "無法匯入影片", en: "Unable to Import Video"), isPresented: Binding(
                 get: { importErrorMessage != nil },
                 set: { isPresented in
                     if !isPresented {
@@ -1404,11 +1587,11 @@ struct SavedVideosView: View {
                     }
                 }
             )) {
-                Button("確定", role: .cancel) { }
+                Button(localized(appLanguage, zh: "確定", en: "OK"), role: .cancel) { }
             } message: {
                 Text(importErrorMessage ?? "")
             }
-            .alert("無法重新命名", isPresented: Binding(
+            .alert(localized(appLanguage, zh: "無法重新命名", en: "Unable to Rename"), isPresented: Binding(
                 get: { renameErrorMessage != nil },
                 set: { isPresented in
                     if !isPresented {
@@ -1416,7 +1599,7 @@ struct SavedVideosView: View {
                     }
                 }
             )) {
-                Button("確定", role: .cancel) { }
+                Button(localized(appLanguage, zh: "確定", en: "OK"), role: .cancel) { }
             } message: {
                 Text(renameErrorMessage ?? "")
             }
@@ -1429,7 +1612,7 @@ struct SavedVideosView: View {
         importedVideoItem = nil
 
         guard let savedVideo else {
-            importErrorMessage = "影片已選取，但匯入到 app 失敗。"
+            importErrorMessage = localized(appLanguage, zh: "影片已選取，但匯入到 app 失敗。", en: "A video was selected, but importing it into the app failed.")
             return
         }
 
@@ -1448,7 +1631,7 @@ struct SavedVideosView: View {
                 await MainActor.run {
                     isImportingVideo = false
                     importedVideoItem = nil
-                    importErrorMessage = "選取的影片無法讀取。"
+                    importErrorMessage = localized(appLanguage, zh: "選取的影片無法讀取。", en: "The selected video could not be read.")
                 }
                 return
             }
@@ -1715,6 +1898,7 @@ struct VideoPlayerScreen: View {
 struct VideoReviewScreen: View {
     let video: SavedVideo
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
 
     @State private var player = AVPlayer()
     @State private var session: ReviewSession?
@@ -1727,6 +1911,10 @@ struct VideoReviewScreen: View {
     @State private var selectedReviewEvent: MovementEvent?
     @State private var timeObserver: Any?
 
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -1738,7 +1926,7 @@ struct VideoReviewScreen: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                         if session == nil {
-                            ProgressView("分析影片中...")
+                            ProgressView(localized(appLanguage, zh: "分析影片中...", en: "Analyzing Video..."))
                                 .padding(20)
                                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                         }
@@ -1765,7 +1953,7 @@ struct VideoReviewScreen: View {
                         reviewEventList(session: session)
                         reviewTrackPreview(session: session)
                     } else {
-                        Text("正在建立 review 資料模型與事件點。")
+                        Text(localized(appLanguage, zh: "正在建立 review 資料模型與事件點。", en: "Building the review model and event markers."))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -1774,7 +1962,7 @@ struct VideoReviewScreen: View {
                 .padding(20)
             }
             .background(Color(.systemBackground))
-            .navigationTitle("影片 Review")
+            .navigationTitle(localized(appLanguage, zh: "影片分析", en: "Video Review"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
@@ -1785,7 +1973,7 @@ struct VideoReviewScreen: View {
                     }
                     .disabled(session == nil)
 
-                    Button("完成") {
+                    Button(localized(appLanguage, zh: "完成", en: "Done")) {
                         dismiss()
                     }
                 }
@@ -1795,6 +1983,10 @@ struct VideoReviewScreen: View {
                     ReviewCourtMapScreen(
                         session: session,
                         currentTime: $currentTime,
+                        duration: duration,
+                        isPlaying: $isPlaying,
+                        onTogglePlayback: toggleReviewPlayback,
+                        onSeek: seekReview,
                         selectedEvent: selectedMapEvent
                     )
                 }
@@ -1890,14 +2082,14 @@ struct VideoReviewScreen: View {
 
     private func reviewSummary(session: ReviewSession) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Review Session")
+            Text(localized(appLanguage, zh: "分析摘要", en: "Review Session"))
                 .font(.headline)
 
             HStack {
-                reviewStat(title: "影片長度", value: reviewTimeString(session.duration))
-                reviewStat(title: "分析影格", value: "\(session.trackFrames.count)")
-                reviewStat(title: "事件點", value: "\(session.movementEvents.count)")
-                reviewStat(title: "AI 建議", value: "\(session.suggestions.count)")
+                reviewStat(title: localized(appLanguage, zh: "影片長度", en: "Duration"), value: reviewTimeString(session.duration))
+                reviewStat(title: localized(appLanguage, zh: "分析影格", en: "Frames"), value: "\(session.trackFrames.count)")
+                reviewStat(title: localized(appLanguage, zh: "事件點", en: "Events"), value: "\(session.movementEvents.count)")
+                reviewStat(title: localized(appLanguage, zh: "AI 建議", en: "AI Tips"), value: "\(session.suggestions.count)")
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1907,7 +2099,7 @@ struct VideoReviewScreen: View {
 
     private func reviewTimeline(session: ReviewSession) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Review Timeline")
+            Text(localized(appLanguage, zh: "分析時間軸", en: "Review Timeline"))
                 .font(.headline)
 
             ReviewTimelineView(
@@ -1949,7 +2141,7 @@ struct VideoReviewScreen: View {
 
     private func reviewEventList(session: ReviewSession) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Movement Events")
+            Text(localized(appLanguage, zh: "移動事件", en: "Movement Events"))
                 .font(.headline)
 
             ForEach(session.movementEvents) { event in
@@ -1975,7 +2167,7 @@ struct VideoReviewScreen: View {
                             .multilineTextAlignment(.leading)
 
                         HStack {
-                            Text(event.playerLabel ?? "雙人站位")
+                            Text(event.playerLabel ?? localized(appLanguage, zh: "雙人站位", en: "Team Positioning"))
                             Spacer()
                             Text("\(reviewTimeString(event.startTime)) - \(reviewTimeString(event.endTime))")
                         }
@@ -1995,7 +2187,7 @@ struct VideoReviewScreen: View {
 
     private func reviewSuggestionList(session: ReviewSession) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("AI Suggestions")
+            Text(localized(appLanguage, zh: "AI 建議", en: "AI Suggestions"))
                 .font(.headline)
 
             ForEach(session.suggestions) { suggestion in
@@ -2023,7 +2215,7 @@ struct VideoReviewScreen: View {
                             .multilineTextAlignment(.leading)
 
                         HStack {
-                            Text(suggestion.playerLabel ?? "雙人站位")
+                            Text(suggestion.playerLabel ?? localized(appLanguage, zh: "雙人站位", en: "Team Positioning"))
                             Spacer()
                             Text("\(reviewTimeString(suggestion.timeRange.lowerBound)) - \(reviewTimeString(suggestion.timeRange.upperBound))")
                         }
@@ -2043,7 +2235,7 @@ struct VideoReviewScreen: View {
 
     private func reviewTrackPreview(session: ReviewSession) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Track Frames")
+            Text(localized(appLanguage, zh: "追蹤影格", en: "Track Frames"))
                 .font(.headline)
 
             ForEach(session.trackFrames.prefix(6)) { frame in
@@ -2159,10 +2351,15 @@ struct VideoReviewScreen: View {
 
 struct ReviewFrameSummary: View {
     let frame: PlayerTrackFrame
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
+
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("目前分析幀")
+            Text(localized(appLanguage, zh: "目前分析幀", en: "Current Frame"))
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.8))
 
@@ -2194,11 +2391,16 @@ struct ReviewFrameSummary: View {
 
 struct ActiveMovementEventCard: View {
     let event: MovementEvent
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
+
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("目前事件")
+                Text(localized(appLanguage, zh: "目前事件", en: "Current Event"))
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.82))
 
@@ -2242,11 +2444,16 @@ struct ActiveMovementEventCard: View {
 
 struct ActiveReviewSuggestionCard: View {
     let suggestion: ReviewSuggestion
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
+
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("AI 建議")
+                Text(localized(appLanguage, zh: "AI 建議", en: "AI Suggestion"))
                     .font(.caption)
                     .foregroundStyle(.white.opacity(0.82))
 
@@ -2269,7 +2476,7 @@ struct ActiveReviewSuggestionCard: View {
                 .foregroundStyle(.white.opacity(0.94))
 
             HStack {
-                Text(suggestion.playerLabel ?? "雙人站位")
+                Text(suggestion.playerLabel ?? localized(appLanguage, zh: "雙人站位", en: "Team Positioning"))
                 Spacer()
                 Text("\(timeString(suggestion.timeRange.lowerBound)) - \(timeString(suggestion.timeRange.upperBound))")
             }
@@ -2334,41 +2541,65 @@ struct ReviewTimelineView: View {
 struct ReviewCourtMapScreen: View {
     let session: ReviewSession
     @Binding var currentTime: Double
+    let duration: Double
+    @Binding var isPlaying: Bool
+    let onTogglePlayback: () -> Void
+    let onSeek: (Double) -> Void
     let selectedEvent: MovementEvent?
 
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
+    @State private var isSeeking = false
+
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
 
     private enum MapConstants {
         static let recentTrailDuration: Double = 1.5
     }
 
+    private var courtMapFrames: [PlayerTrackFrame] {
+        filteredCourtMapFrames(from: session.trackFrames)
+    }
+
+    private var courtMapFramesWithPlayers: [PlayerTrackFrame] {
+        courtMapFrames.filter { frame in
+            frame.players.contains { $0.playerAreaPoint != nil }
+        }
+    }
+
     private var currentFrame: PlayerTrackFrame? {
-        guard !session.trackFrames.isEmpty else { return nil }
-        return session.trackFrames.min(by: { abs($0.time - currentTime) < abs($1.time - currentTime) })
+        guard !courtMapFramesWithPlayers.isEmpty else { return nil }
+        return courtMapFramesWithPlayers.min(by: { abs($0.time - currentTime) < abs($1.time - currentTime) })
     }
 
     private var displayedTrailFrames: [PlayerTrackFrame] {
         if let selectedEvent {
-            return session.trackFrames.filter { frame in
+            let selectedFrames = courtMapFramesWithPlayers.filter { frame in
                 frame.time >= selectedEvent.startTime && frame.time <= selectedEvent.endTime
             }
+            return selectedFrames.isEmpty ? (currentFrame.map { [$0] } ?? []) : selectedFrames
         }
 
         let trailStart = max(currentTime - MapConstants.recentTrailDuration, 0)
-        return session.trackFrames.filter { frame in
+        let trailFrames = courtMapFramesWithPlayers.filter { frame in
             frame.time >= trailStart && frame.time <= currentTime
         }
+        return trailFrames.isEmpty ? (currentFrame.map { [$0] } ?? []) : trailFrames
     }
 
     private var modeTitle: String {
-        selectedEvent == nil ? "Live Position + Recent Trails" : "Selected Rally Trajectory"
+        selectedEvent == nil
+            ? localized(appLanguage, zh: "即時位置與最近軌跡", en: "Live Position + Recent Trails")
+            : localized(appLanguage, zh: "所選回合軌跡", en: "Selected Rally Trajectory")
     }
 
     private var modeDetail: String {
         if let selectedEvent {
             return "\(selectedEvent.title) · \(timeString(selectedEvent.startTime)) - \(timeString(selectedEvent.endTime))"
         }
-        return "Closest analyzed frame at \(timeString(currentTime)) with the last 1.5 seconds of movement."
+        return localized(appLanguage, zh: "顯示最接近 \(timeString(currentTime)) 的分析影格，以及前 1.5 秒的移動軌跡。", en: "Showing the analyzed frame closest to \(timeString(currentTime)) with the last 1.5 seconds of movement.")
     }
 
     var body: some View {
@@ -2382,6 +2613,8 @@ struct ReviewCourtMapScreen: View {
                     )
                     .frame(maxWidth: .infinity)
                     .aspectRatio(0.9, contentMode: .fit)
+
+                    courtMapPlaybackControls
 
                     VStack(alignment: .leading, spacing: 8) {
                         Text(modeTitle)
@@ -2401,7 +2634,7 @@ struct ReviewCourtMapScreen: View {
                         Spacer()
                     }
 
-                    Text("Top edge = closer to the table. Positions come from each player bounding box foot point mapped into the normalized player-area coordinates.")
+                    Text(localized(appLanguage, zh: "上方代表更靠近球桌。位置來自每位球員 bounding box 的腳底點，並映射到標準化的跑動區域座標。", en: "The top edge is closer to the table. Positions come from each player's bounding-box foot point mapped into normalized player-area coordinates."))
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2409,11 +2642,11 @@ struct ReviewCourtMapScreen: View {
                 .padding(20)
             }
             .background(Color(.systemBackground))
-            .navigationTitle("2D Court Map")
+            .navigationTitle(localized(appLanguage, zh: "2D 球場地圖", en: "2D Court Map"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("Done") {
+                    Button(localized(appLanguage, zh: "完成", en: "Done")) {
                         dismiss()
                     }
                 }
@@ -2426,6 +2659,53 @@ struct ReviewCourtMapScreen: View {
         let minutes = totalSeconds / 60
         let remainingSeconds = totalSeconds % 60
         return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    private var courtMapPlaybackControls: some View {
+        HStack(spacing: 16) {
+            Button(action: onTogglePlayback) {
+                Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 20, weight: .semibold))
+                    .frame(width: 52, height: 52)
+                    .background(Color.blue.opacity(0.12))
+                    .foregroundStyle(.blue)
+                    .clipShape(Circle())
+            }
+
+            VStack(spacing: 8) {
+                Slider(
+                    value: Binding(
+                        get: {
+                            guard duration > 0 else { return 0 }
+                            return currentTime / duration
+                        },
+                        set: { newValue in
+                            isSeeking = true
+                            currentTime = duration * newValue
+                        }
+                    ),
+                    in: 0...1,
+                    onEditingChanged: { editing in
+                        if editing {
+                            isSeeking = true
+                        } else {
+                            onSeek(currentTime)
+                            isSeeking = false
+                        }
+                    }
+                )
+
+                HStack {
+                    Text(timeString(currentTime))
+                    Spacer()
+                    Text(timeString(duration))
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+        }
+        .padding(18)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
     }
 }
 
@@ -2541,13 +2821,14 @@ struct ReviewCourtMapView: View {
                 ForEach(currentPlayers, id: \.id) { player in
                     if let point = player.playerAreaPoint {
                         let position = mappedPosition(for: point, in: playerZoneRect)
+                        let isCurrentHitter = player.id == currentHitterID
 
                         Circle()
                             .fill(playerColor(for: player))
                             .frame(width: 18, height: 18)
                             .overlay {
                                 Circle()
-                                    .stroke(Color.white, lineWidth: 3)
+                                    .stroke(isCurrentHitter ? .red : .white, lineWidth: 3)
                             }
                             .position(position)
 
@@ -2573,6 +2854,22 @@ struct ReviewCourtMapView: View {
 
     private var currentPlayers: [TrackedPlayerBox] {
         currentFrame?.players.filter { $0.playerAreaPoint != nil } ?? []
+    }
+
+    private var currentHitterID: String? {
+        if let markedHitter = currentPlayers.first(where: \.isCurrentHitter)?.id {
+            return markedHitter
+        }
+
+        return currentPlayers.min { lhs, rhs in
+            guard
+                let lhsPoint = lhs.playerAreaPoint,
+                let rhsPoint = rhs.playerAreaPoint
+            else {
+                return false
+            }
+            return lhsPoint.y < rhsPoint.y
+        }?.id
     }
 
     private func playerColor(for player: TrackedPlayerBox) -> Color {
@@ -3351,14 +3648,14 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 observation.confidence >= TrackingConstants.minimumHumanConfidence &&
                 (observation.boundingBox.width * observation.boundingBox.height) >= TrackingConstants.minimumHumanArea
             }
-            .sorted { $0.boundingBox.midX < $1.boundingBox.midX }
+            .map(\.boundingBox)
 
         if strictMatches.count >= TrackingConstants.playerLabels.count {
             return HumanDetectionResult(
                 source: "rectangles-strict",
                 rectangleCandidates: observations.map(\.boundingBox),
                 bodyPoseCandidates: [],
-                selectedCandidates: strictMatches.map(\.boundingBox)
+                selectedCandidates: selectNearestTwoPlayerBoxes(from: strictMatches)
             )
         }
 
@@ -3367,7 +3664,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 observation.confidence >= TrackingConstants.fallbackHumanConfidence &&
                 (observation.boundingBox.width * observation.boundingBox.height) >= TrackingConstants.fallbackHumanArea
             }
-            .sorted { $0.boundingBox.midX < $1.boundingBox.midX }
             .map(\.boundingBox)
 
         if relaxedRectangleMatches.count >= TrackingConstants.playerLabels.count {
@@ -3375,7 +3671,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 source: "rectangles-relaxed",
                 rectangleCandidates: observations.map(\.boundingBox),
                 bodyPoseCandidates: [],
-                selectedCandidates: relaxedRectangleMatches
+                selectedCandidates: selectNearestTwoPlayerBoxes(from: relaxedRectangleMatches)
             )
         }
 
@@ -3385,7 +3681,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 source: "body-pose",
                 rectangleCandidates: observations.map(\.boundingBox),
                 bodyPoseCandidates: bodyPoseBoxes,
-                selectedCandidates: bodyPoseBoxes
+                selectedCandidates: selectNearestTwoPlayerBoxes(from: bodyPoseBoxes)
             )
         }
 
@@ -3393,7 +3689,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             source: "rectangles-fallback",
             rectangleCandidates: observations.map(\.boundingBox),
             bodyPoseCandidates: bodyPoseBoxes,
-            selectedCandidates: relaxedRectangleMatches
+            selectedCandidates: selectNearestTwoPlayerBoxes(from: relaxedRectangleMatches)
         )
     }
 
@@ -3712,10 +4008,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
     }
 
     private func playerFootPoint(for boundingBox: CGRect) -> CGPoint {
-        CGPoint(
-            x: boundingBox.midX,
-            y: 1 - boundingBox.minY
-        )
+        normalizedPlayerFootPoint(for: boundingBox)
     }
 
     private func lateralPositionLabel(for point: CGPoint) -> String {
