@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AVKit
+import Photos
 import PhotosUI
 import UIKit
 import Vision
@@ -450,8 +451,8 @@ struct ContentView: View {
         isClosingSession = true
         isWaitingForLandscapeRecording = false
 
-        cameraManager.stopSession(saveRecording: saveRecording) { temporaryURL in
-            if let temporaryURL, let savedVideo = videoLibrary.saveVideo(from: temporaryURL) {
+        cameraManager.stopSession(saveRecording: saveRecording) { output in
+            if let output, let savedVideo = videoLibrary.saveRecordedVideo(from: output) {
                 print("Saved video at \(savedVideo.url)")
             }
 
@@ -526,8 +527,11 @@ struct TrackedPlayerBox: Identifiable, Equatable, Hashable {
 }
 
 private func cameraProximityScore(for boundingBox: CGRect) -> CGFloat {
+    let footPoint = normalizedPlayerFootPoint(for: boundingBox)
     let areaScore = boundingBox.width * boundingBox.height
-    return areaScore + (boundingBox.height * 0.1)
+    let heightScore = boundingBox.height
+    let footlineScore = footPoint.y
+    return (footlineScore * 1.8) + (heightScore * 0.9) + (areaScore * 0.4)
 }
 
 private func normalizedPlayerFootPoint(for boundingBox: CGRect) -> CGPoint {
@@ -551,8 +555,22 @@ private func fallbackCourtMapPoint(for boundingBox: CGRect) -> CGPoint {
 }
 
 private func selectNearestTwoPlayerBoxes(from boundingBoxes: [CGRect]) -> [CGRect] {
-    Array(
-        boundingBoxes
+    let sortedByFootline = boundingBoxes.sorted {
+        normalizedPlayerFootPoint(for: $0).y > normalizedPlayerFootPoint(for: $1).y
+    }
+
+    let filteredByFootline: [CGRect]
+    if let nearestFootline = sortedByFootline.first.map({ normalizedPlayerFootPoint(for: $0).y }) {
+        let foregroundCandidates = sortedByFootline.filter {
+            normalizedPlayerFootPoint(for: $0).y >= (nearestFootline - 0.18)
+        }
+        filteredByFootline = foregroundCandidates.count >= 2 ? foregroundCandidates : sortedByFootline
+    } else {
+        filteredByFootline = sortedByFootline
+    }
+
+    return Array(
+        filteredByFootline
             .sorted { lhs, rhs in
                 let lhsScore = cameraProximityScore(for: lhs)
                 let rhsScore = cameraProximityScore(for: rhs)
@@ -798,6 +816,95 @@ struct SavedVideo: Identifiable, Hashable {
     var title: String {
         url.deletingPathExtension().lastPathComponent
     }
+
+    var trackingDataURL: URL {
+        Self.trackingDataURL(forVideoURL: url)
+    }
+
+    static func trackingDataURL(forVideoURL videoURL: URL) -> URL {
+        videoURL.deletingPathExtension().appendingPathExtension("tracking.json")
+    }
+}
+
+private struct RecordedSessionOutput {
+    let videoURL: URL
+    let trackingDataURL: URL?
+}
+
+private struct TrackingSidecarFile: Codable {
+    let frames: [TrackingSidecarFrame]
+}
+
+private struct TrackingSidecarFrame: Codable {
+    let time: Double
+    let players: [TrackingSidecarPlayer]
+
+    init(frame: PlayerTrackFrame) {
+        self.time = frame.time
+        self.players = frame.players.map(TrackingSidecarPlayer.init)
+    }
+
+    func playerTrackFrame() -> PlayerTrackFrame {
+        PlayerTrackFrame(
+            time: time,
+            players: players.map { $0.trackedPlayerBox() }
+        )
+    }
+}
+
+private struct TrackingSidecarPlayer: Codable {
+    let id: String
+    let label: String
+    let boundingBoxX: Double
+    let boundingBoxY: Double
+    let boundingBoxWidth: Double
+    let boundingBoxHeight: Double
+    let footPointX: Double?
+    let footPointY: Double?
+    let playerAreaPointX: Double?
+    let playerAreaPointY: Double?
+    let lateralPosition: String?
+    let depthPosition: String?
+    let isCurrentHitter: Bool
+
+    init(player: TrackedPlayerBox) {
+        self.id = player.id
+        self.label = player.label
+        self.boundingBoxX = player.boundingBox.origin.x
+        self.boundingBoxY = player.boundingBox.origin.y
+        self.boundingBoxWidth = player.boundingBox.size.width
+        self.boundingBoxHeight = player.boundingBox.size.height
+        self.footPointX = player.footPoint.map { Double($0.x) }
+        self.footPointY = player.footPoint.map { Double($0.y) }
+        self.playerAreaPointX = player.playerAreaPoint.map { Double($0.x) }
+        self.playerAreaPointY = player.playerAreaPoint.map { Double($0.y) }
+        self.lateralPosition = player.lateralPosition
+        self.depthPosition = player.depthPosition
+        self.isCurrentHitter = player.isCurrentHitter
+    }
+
+    func trackedPlayerBox() -> TrackedPlayerBox {
+        TrackedPlayerBox(
+            id: id,
+            label: label,
+            boundingBox: CGRect(
+                x: boundingBoxX,
+                y: boundingBoxY,
+                width: boundingBoxWidth,
+                height: boundingBoxHeight
+            ),
+            footPoint: point(x: footPointX, y: footPointY),
+            playerAreaPoint: point(x: playerAreaPointX, y: playerAreaPointY),
+            lateralPosition: lateralPosition,
+            depthPosition: depthPosition,
+            isCurrentHitter: isCurrentHitter
+        )
+    }
+
+    private func point(x: Double?, y: Double?) -> CGPoint? {
+        guard let x, let y else { return nil }
+        return CGPoint(x: x, y: y)
+    }
 }
 
 private struct ImportedReviewVideo: Transferable {
@@ -834,16 +941,42 @@ struct PlayerTrackFrame: Identifiable, Hashable {
     let players: [TrackedPlayerBox]
 }
 
+private func normalizedTrackFrameTimes(_ frames: [PlayerTrackFrame]) -> [PlayerTrackFrame] {
+    guard let firstTime = frames.first(where: { $0.time.isFinite })?.time else {
+        return frames
+    }
+
+    return frames.map { frame in
+        PlayerTrackFrame(
+            time: max(frame.time - firstTime, 0),
+            players: frame.players
+        )
+    }
+}
+
 private struct CourtMapJumpFilterState {
     var acceptedPoint: CGPoint
     var pendingPoint: CGPoint?
     var pendingCount = 0
 }
 
+private func limitedStepPoint(from current: CGPoint, toward target: CGPoint, maxStep: CGFloat) -> CGPoint {
+    let deltaX = target.x - current.x
+    let deltaY = target.y - current.y
+    let distance = hypot(deltaX, deltaY)
+    guard distance > 0.0001 else { return target }
+    guard distance > maxStep else { return target }
+
+    let scale = maxStep / distance
+    return CGPoint(
+        x: current.x + (deltaX * scale),
+        y: current.y + (deltaY * scale)
+    )
+}
+
 private func filteredCourtMapFrames(from frames: [PlayerTrackFrame]) -> [PlayerTrackFrame] {
     var filterStates: [String: CourtMapJumpFilterState] = [:]
-
-    return frames.map { frame in
+    let jumpFilteredFrames = frames.map { frame in
         let filteredPlayers = frame.players.map { player in
             guard let point = player.playerAreaPoint else { return player }
 
@@ -855,30 +988,38 @@ private func filteredCourtMapFrames(from frames: [PlayerTrackFrame]) -> [PlayerT
                     state.pendingPoint = nil
                     state.pendingCount = 0
                     filteredPoint = point
-                } else if let pendingPoint = state.pendingPoint {
-                    let pendingDistance = hypot(point.x - pendingPoint.x, point.y - pendingPoint.y)
-                    if pendingDistance <= 0.08 {
+                } else if jumpDistance <= 0.5 {
+                    // Preserve continuous movement while still damping abrupt drift.
+                    state.acceptedPoint = limitedStepPoint(from: state.acceptedPoint, toward: point, maxStep: 0.18)
+                    state.pendingPoint = nil
+                    state.pendingCount = 0
+                    filteredPoint = state.acceptedPoint
+                } else {
+                    let blendedPendingPoint: CGPoint
+                    if let pendingPoint = state.pendingPoint {
+                        blendedPendingPoint = CGPoint(
+                            x: (pendingPoint.x + point.x) / 2,
+                            y: (pendingPoint.y + point.y) / 2
+                        )
                         state.pendingCount += 1
-                        if state.pendingCount >= 2 {
-                            state.acceptedPoint = CGPoint(
-                                x: (pendingPoint.x + point.x) / 2,
-                                y: (pendingPoint.y + point.y) / 2
-                            )
-                            state.pendingPoint = nil
-                            state.pendingCount = 0
-                            filteredPoint = state.acceptedPoint
-                        } else {
-                            filteredPoint = state.acceptedPoint
-                        }
                     } else {
-                        state.pendingPoint = point
+                        blendedPendingPoint = point
                         state.pendingCount = 1
+                    }
+
+                    state.pendingPoint = blendedPendingPoint
+                    if state.pendingCount >= 2 {
+                        state.acceptedPoint = limitedStepPoint(
+                            from: state.acceptedPoint,
+                            toward: blendedPendingPoint,
+                            maxStep: 0.22
+                        )
+                        state.pendingPoint = nil
+                        state.pendingCount = 0
+                        filteredPoint = state.acceptedPoint
+                    } else {
                         filteredPoint = state.acceptedPoint
                     }
-                } else {
-                    state.pendingPoint = point
-                    state.pendingCount = 1
-                    filteredPoint = state.acceptedPoint
                 }
                 filterStates[player.id] = state
             } else {
@@ -899,6 +1040,107 @@ private func filteredCourtMapFrames(from frames: [PlayerTrackFrame]) -> [PlayerT
         }
 
         return PlayerTrackFrame(time: frame.time, players: filteredPlayers)
+    }
+
+    return interpolateCourtMapFramesRemovingFrontInvalidPoints(from: jumpFilteredFrames)
+}
+
+private func interpolateCourtMapFramesRemovingFrontInvalidPoints(from frames: [PlayerTrackFrame]) -> [PlayerTrackFrame] {
+    guard let frontLimitY = courtMapFrontLimitY(from: frames) else {
+        return frames
+    }
+
+    let playerIDs = Array(
+        Set(frames.flatMap { $0.players.map(\.id) })
+    ).sorted()
+
+    var overriddenPointsByFrameIndex: [Int: [String: CGPoint]] = [:]
+
+    for playerID in playerIDs {
+        let indexedPoints = frames.enumerated().compactMap { index, frame -> (Int, CGPoint)? in
+            guard
+                let player = frame.players.first(where: { $0.id == playerID }),
+                let point = player.playerAreaPoint
+            else {
+                return nil
+            }
+            return (index, point)
+        }
+
+        guard !indexedPoints.isEmpty else { continue }
+
+        var validIndicesAndPoints: [(Int, CGPoint)] = []
+        let invalidIndices = indexedPoints.compactMap { index, point in
+            point.y < frontLimitY ? index : nil
+        }
+
+        for (index, point) in indexedPoints where point.y >= frontLimitY {
+            validIndicesAndPoints.append((index, point))
+        }
+
+        for invalidIndex in invalidIndices {
+            guard
+                let previousValid = validIndicesAndPoints.last(where: { $0.0 < invalidIndex }),
+                let nextValid = validIndicesAndPoints.first(where: { $0.0 > invalidIndex })
+            else {
+                continue
+            }
+
+            let frameSpan = nextValid.0 - previousValid.0
+            guard frameSpan > 0 else { continue }
+
+            let progress = CGFloat(invalidIndex - previousValid.0) / CGFloat(frameSpan)
+            let interpolatedPoint = CGPoint(
+                x: previousValid.1.x + ((nextValid.1.x - previousValid.1.x) * progress),
+                y: previousValid.1.y + ((nextValid.1.y - previousValid.1.y) * progress)
+            )
+            overriddenPointsByFrameIndex[invalidIndex, default: [:]][playerID] = interpolatedPoint
+        }
+    }
+
+    return frames.enumerated().map { index, frame in
+        guard let overriddenPoints = overriddenPointsByFrameIndex[index] else {
+            return frame
+        }
+
+        let players = frame.players.map { player in
+            guard let point = overriddenPoints[player.id] else { return player }
+            return player.updatingPlayerAreaPoint(point)
+        }
+        return PlayerTrackFrame(time: frame.time, players: players)
+    }
+}
+
+private func courtMapFrontLimitY(from frames: [PlayerTrackFrame]) -> CGFloat? {
+    for frame in frames {
+        if let hitter = frame.players.first(where: { $0.isCurrentHitter }),
+           let point = hitter.playerAreaPoint {
+            return point.y
+        }
+    }
+
+    for frame in frames {
+        let points = frame.players.compactMap(\.playerAreaPoint)
+        if let fallbackFrontPlayer = points.min(by: { $0.y < $1.y }) {
+            return fallbackFrontPlayer.y
+        }
+    }
+
+    return nil
+}
+
+private extension TrackedPlayerBox {
+    func updatingPlayerAreaPoint(_ point: CGPoint) -> TrackedPlayerBox {
+        TrackedPlayerBox(
+            id: id,
+            label: label,
+            boundingBox: boundingBox,
+            footPoint: footPoint,
+            playerAreaPoint: point,
+            lateralPosition: lateralPosition,
+            depthPosition: depthPosition,
+            isCurrentHitter: isCurrentHitter
+        )
     }
 }
 
@@ -955,6 +1197,18 @@ enum VideoReviewAnalyzer {
         let asset = AVURLAsset(url: video.url)
         let duration = normalizedDuration(from: asset.duration)
 
+        if let sidecarFrames = loadTrackFramesFromSidecar(for: video) {
+            let movementEvents = buildMovementEvents(from: sidecarFrames)
+            let suggestions = buildSuggestions(from: movementEvents)
+            return ReviewSession(
+                video: video,
+                duration: duration,
+                trackFrames: sidecarFrames,
+                movementEvents: movementEvents,
+                suggestions: suggestions
+            )
+        }
+
         guard
             let track = asset.tracks(withMediaType: .video).first,
             let reader = try? AVAssetReader(asset: asset)
@@ -1003,15 +1257,30 @@ enum VideoReviewAnalyzer {
             }
         }
 
-        let movementEvents = buildMovementEvents(from: trackFrames)
+        let normalizedTrackFrames = normalizedTrackFrameTimes(trackFrames)
+        let movementEvents = buildMovementEvents(from: normalizedTrackFrames)
         let suggestions = buildSuggestions(from: movementEvents)
         return ReviewSession(
             video: video,
             duration: duration,
-            trackFrames: trackFrames,
+            trackFrames: normalizedTrackFrames,
             movementEvents: movementEvents,
             suggestions: suggestions
         )
+    }
+
+    private static func loadTrackFramesFromSidecar(for video: SavedVideo) -> [PlayerTrackFrame]? {
+        let sidecarURL = video.trackingDataURL
+        guard FileManager.default.fileExists(atPath: sidecarURL.path) else { return nil }
+
+        do {
+            let data = try Data(contentsOf: sidecarURL)
+            let sidecar = try JSONDecoder().decode(TrackingSidecarFile.self, from: data)
+            return normalizedTrackFrameTimes(sidecar.frames.map { $0.playerTrackFrame() })
+        } catch {
+            print("Failed to load tracking sidecar: \(error)")
+            return nil
+        }
     }
 
     private static func detectPlayers(
@@ -1342,16 +1611,26 @@ final class VideoLibraryManager: ObservableObject {
 
     @discardableResult
     func saveVideo(from temporaryURL: URL) -> SavedVideo? {
-        persistVideo(from: temporaryURL, preferredExtension: temporaryURL.pathExtension, copyItem: false)
+        persistVideo(from: temporaryURL, preferredExtension: temporaryURL.pathExtension, copyItem: false, trackingDataURL: nil)
+    }
+
+    @discardableResult
+    fileprivate func saveRecordedVideo(from output: RecordedSessionOutput) -> SavedVideo? {
+        persistVideo(
+            from: output.videoURL,
+            preferredExtension: output.videoURL.pathExtension,
+            copyItem: false,
+            trackingDataURL: output.trackingDataURL
+        )
     }
 
     @discardableResult
     func importVideo(from sourceURL: URL) -> SavedVideo? {
-        persistVideo(from: sourceURL, preferredExtension: sourceURL.pathExtension, copyItem: true)
+        persistVideo(from: sourceURL, preferredExtension: sourceURL.pathExtension, copyItem: true, trackingDataURL: nil)
     }
 
     @discardableResult
-    private func persistVideo(from sourceURL: URL, preferredExtension: String, copyItem: Bool) -> SavedVideo? {
+    private func persistVideo(from sourceURL: URL, preferredExtension: String, copyItem: Bool, trackingDataURL: URL?) -> SavedVideo? {
         let fileManager = FileManager.default
         let directory = Self.storageDirectoryURL()
 
@@ -1364,15 +1643,27 @@ final class VideoLibraryManager: ObservableObject {
             let finalURL = directory
                 .appendingPathComponent("TTCoach-\(formatter.string(from: Date()))")
                 .appendingPathExtension(normalizedVideoExtension(from: preferredExtension))
+            let finalTrackingURL = SavedVideo.trackingDataURL(forVideoURL: finalURL)
 
             if fileManager.fileExists(atPath: finalURL.path) {
                 try fileManager.removeItem(at: finalURL)
+            }
+            if fileManager.fileExists(atPath: finalTrackingURL.path) {
+                try fileManager.removeItem(at: finalTrackingURL)
             }
 
             if copyItem {
                 try fileManager.copyItem(at: sourceURL, to: finalURL)
             } else {
                 try fileManager.moveItem(at: sourceURL, to: finalURL)
+            }
+
+            if let trackingDataURL, fileManager.fileExists(atPath: trackingDataURL.path) {
+                if copyItem {
+                    try fileManager.copyItem(at: trackingDataURL, to: finalTrackingURL)
+                } else {
+                    try fileManager.moveItem(at: trackingDataURL, to: finalTrackingURL)
+                }
             }
 
             let savedVideo = SavedVideo(url: finalURL, createdAt: Date())
@@ -1388,18 +1679,15 @@ final class VideoLibraryManager: ObservableObject {
     }
 
     func deleteVideos(at offsets: IndexSet) {
-        let fileManager = FileManager.default
-
         for index in offsets {
             let video = videos[index]
-            try? fileManager.removeItem(at: video.url)
+            deleteVideo(video)
         }
-
-        refreshVideos()
     }
 
     func deleteVideo(_ video: SavedVideo) {
         try? FileManager.default.removeItem(at: video.url)
+        try? FileManager.default.removeItem(at: video.trackingDataURL)
         refreshVideos()
     }
 
@@ -1411,12 +1699,18 @@ final class VideoLibraryManager: ObservableObject {
         let destinationURL = video.url.deletingLastPathComponent()
             .appendingPathComponent(trimmedName)
             .appendingPathExtension(video.url.pathExtension)
+        let sourceTrackingURL = video.trackingDataURL
+        let destinationTrackingURL = SavedVideo.trackingDataURL(forVideoURL: destinationURL)
 
         guard destinationURL != video.url else { return true }
         guard !FileManager.default.fileExists(atPath: destinationURL.path) else { return false }
+        guard !FileManager.default.fileExists(atPath: destinationTrackingURL.path) else { return false }
 
         do {
             try FileManager.default.moveItem(at: video.url, to: destinationURL)
+            if FileManager.default.fileExists(atPath: sourceTrackingURL.path) {
+                try FileManager.default.moveItem(at: sourceTrackingURL, to: destinationTrackingURL)
+            }
             refreshVideos()
             return true
         } catch {
@@ -1657,6 +1951,7 @@ struct SavedVideosView: View {
 struct VideoPlayerScreen: View {
     let video: SavedVideo
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
     @State private var player = AVPlayer()
     @State private var presentationInfo = VideoPresentationInfo()
     @State private var isPlaying = false
@@ -1667,6 +1962,12 @@ struct VideoPlayerScreen: View {
     @State private var isSeeking = false
     @State private var timeObserver: Any?
     @State private var controlsHideWorkItem: DispatchWorkItem?
+    @State private var isSavingToPhotoLibrary = false
+    @State private var photoLibrarySaveMessage: String?
+
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
 
     var body: some View {
         NavigationStack {
@@ -1685,15 +1986,37 @@ struct VideoPlayerScreen: View {
                         HStack {
                             Spacer()
 
-                            Button("完成") {
-                                dismiss()
+                            HStack(spacing: 12) {
+                                Button {
+                                    Task {
+                                        await saveVideoToPhotoLibrary()
+                                    }
+                                } label: {
+                                    Group {
+                                        if isSavingToPhotoLibrary {
+                                            ProgressView()
+                                                .tint(.white)
+                                        } else {
+                                            Image(systemName: "arrow.down.to.line")
+                                        }
+                                    }
+                                    .frame(width: 44, height: 44)
+                                    .background(Color.black.opacity(0.7))
+                                    .foregroundStyle(.white)
+                                    .clipShape(Circle())
+                                }
+                                .disabled(isSavingToPhotoLibrary)
+
+                                Button(localized(appLanguage, zh: "完成", en: "Done")) {
+                                    dismiss()
+                                }
+                                .font(.headline)
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                                .background(Color.black.opacity(0.7))
+                                .foregroundStyle(.white)
+                                .clipShape(Capsule())
                             }
-                            .font(.headline)
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 10)
-                            .background(Color.black.opacity(0.7))
-                            .foregroundStyle(.white)
-                            .clipShape(Capsule())
                         }
                         .padding(.horizontal, 20)
                         .padding(.top, 16)
@@ -1729,6 +2052,21 @@ struct VideoPlayerScreen: View {
                 player.pause()
                 isPlaying = false
                 player.replaceCurrentItem(with: nil)
+            }
+            .alert(
+                localized(appLanguage, zh: "下載到相簿", en: "Save to Photos"),
+                isPresented: Binding(
+                    get: { photoLibrarySaveMessage != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            photoLibrarySaveMessage = nil
+                        }
+                    }
+                )
+            ) {
+                Button(localized(appLanguage, zh: "確定", en: "OK"), role: .cancel) { }
+            } message: {
+                Text(photoLibrarySaveMessage ?? "")
             }
         }
     }
@@ -1892,6 +2230,64 @@ struct VideoPlayerScreen: View {
         let minutes = totalSeconds / 60
         let remainingSeconds = totalSeconds % 60
         return String(format: "%02d:%02d", minutes, remainingSeconds)
+    }
+
+    @MainActor
+    private func saveVideoToPhotoLibrary() async {
+        guard !isSavingToPhotoLibrary else { return }
+        isSavingToPhotoLibrary = true
+        defer { isSavingToPhotoLibrary = false }
+
+        let authorizationStatus = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard authorizationStatus == .authorized || authorizationStatus == .limited else {
+            photoLibrarySaveMessage = localized(
+                appLanguage,
+                zh: "沒有相簿存取權限，無法將影片下載到手機相簿。",
+                en: "Photo Library access was not granted, so the video could not be saved."
+            )
+            return
+        }
+
+        do {
+            try await saveVideoFileToPhotoLibrary(video.url)
+            photoLibrarySaveMessage = localized(
+                appLanguage,
+                zh: "影片已下載到手機相簿。",
+                en: "The video was saved to your Photos library."
+            )
+        } catch {
+            photoLibrarySaveMessage = localized(
+                appLanguage,
+                zh: "下載到相簿失敗：\(error.localizedDescription)",
+                en: "Failed to save to Photos: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func saveVideoFileToPhotoLibrary(_ url: URL) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            PHPhotoLibrary.shared().performChanges({
+                let creationRequest = PHAssetCreationRequest.forAsset()
+                creationRequest.addResource(with: .video, fileURL: url, options: nil)
+            }) { success, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if success {
+                    continuation.resume(returning: ())
+                } else {
+                    continuation.resume(throwing: NSError(
+                        domain: "TTCoach.PhotoLibrary",
+                        code: -1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey: NSLocalizedString(
+                                "Unknown photo library save error.",
+                                comment: "Fallback error when saving a video to Photos fails without an underlying system error."
+                            )
+                        ]
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -3020,12 +3416,9 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private enum RallyDetectionConstants {
-        static let minimumImpactLevel: Float = 0.035
-        static let dynamicThresholdMultiplier: Float = 2.8
-        static let impactCooldown: Double = 0.12
-        static let rallyEndSilenceWindow: Double = 1.1
-        static let levelSmoothingFactor: Float = 0.22
-        static let floorAdaptationFactor: Float = 0.015
+        static let stillnessDuration: Double = 3.0
+        static let maximumStillCenterShift: CGFloat = 0.2
+        static let maximumStillSizeShift: CGFloat = 0.08
     }
 
     private enum TrackingConstants {
@@ -3088,17 +3481,24 @@ final class CameraManager: NSObject, ObservableObject {
         let dueTime: Double
     }
 
+    private struct RallyMotionState {
+        var stillnessAnchorPlayers: [TrackedPlayerBox] = []
+        var stillnessStartedAt: Double?
+        var detectedLargeMovementSinceStart = false
+    }
+
     private var isConfigured = false
     private var frameCounter = 0
     private var latestTrackedPlayers: [TrackedPlayerBox] = []
     private var trackingRequests: [VNTrackObjectRequest] = []
     private var missedDetectionFrames = 0
     private var recordingDecision: RecordingDecision = .discard
-    private var stopCompletion: ((URL?) -> Void)?
+    private var stopCompletion: ((RecordedSessionOutput?) -> Void)?
     private var assetWriter: AVAssetWriter?
     private var assetWriterInput: AVAssetWriterInput?
     private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
     private var recordingURL: URL?
+    private var recordingTrackingDataURL: URL?
     private var recordingStartTime: CMTime?
     private var recordingCropRect: CGRect = .zero
     private var recordingRenderSize: CGSize = .zero
@@ -3112,10 +3512,12 @@ final class CameraManager: NSObject, ObservableObject {
     private var lastImpactTimestamp: Double = -.greatestFiniteMagnitude
     private var lastAudioTimestamp: Double = 0
     private var currentRallyState: RallyState = .end
+    private var rallyMotionState = RallyMotionState()
     private var activeHitterState: ActiveHitterState?
     private var pendingRecoverChecks: [PendingRecoverCheck] = []
     private var queuedRallyFeedback = Set<RallyFeedback>()
     private var audioFeedbackMuteUntil: CFTimeInterval = 0
+    private var recordedTrackFrames: [PlayerTrackFrame] = []
 
     func requestPermissionAndStart(completion: @escaping (Bool) -> Void) {
         requestCapturePermissions { granted in
@@ -3129,7 +3531,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    func stopSession(saveRecording: Bool, completion: @escaping (URL?) -> Void) {
+    fileprivate func stopSession(saveRecording: Bool, completion: @escaping (RecordedSessionOutput?) -> Void) {
         recordingDecision = saveRecording ? .save : .discard
         stopCompletion = completion
 
@@ -3247,15 +3649,19 @@ final class CameraManager: NSObject, ObservableObject {
         let temporaryURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("mov")
+        let temporaryTrackingDataURL = SavedVideo.trackingDataURL(forVideoURL: temporaryURL)
 
         try? FileManager.default.removeItem(at: temporaryURL)
+        try? FileManager.default.removeItem(at: temporaryTrackingDataURL)
         recordingURL = temporaryURL
+        recordingTrackingDataURL = temporaryTrackingDataURL
         recordingStartTime = nil
         assetWriter = nil
         assetWriterInput = nil
         pixelBufferAdaptor = nil
         shouldStopRecording = false
         isFinishingRecording = false
+        recordedTrackFrames = []
         isRecording = true
         smoothedAudioLevel = 0
         audioFloorLevel = 0.01
@@ -3268,7 +3674,7 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    private func finishStoppingSession(with outputURL: URL?) {
+    private func finishStoppingSession(with output: RecordedSessionOutput?) {
         isRecording = false
         shouldStopRecording = false
         isFinishingRecording = false
@@ -3277,9 +3683,11 @@ final class CameraManager: NSObject, ObservableObject {
         pixelBufferAdaptor = nil
         recordingStartTime = nil
         recordingURL = nil
+        recordingTrackingDataURL = nil
         recordingCropRect = .zero
         recordingRenderSize = .zero
         recordingSourceCanvasSize = .zero
+        recordedTrackFrames = []
         resetRallyAnalysisState()
 
         if session.isRunning {
@@ -3305,7 +3713,7 @@ final class CameraManager: NSObject, ObservableObject {
         stopCompletion = nil
 
         DispatchQueue.main.async {
-            completion?(outputURL)
+            completion?(output)
         }
     }
 
@@ -3397,6 +3805,7 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private func resetRallyAnalysisStateLocked() {
+        rallyMotionState = RallyMotionState()
         activeHitterState = nil
         pendingRecoverChecks = []
         queuedRallyFeedback = []
@@ -3534,6 +3943,85 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    private func updateRallyStateFromPlayerMovement(with players: [TrackedPlayerBox], timestamp: Double) {
+        guard timestamp.isFinite else { return }
+
+        let trackedPlayers = TrackingConstants.playerLabels.compactMap { label in
+            players.first(where: { $0.id == label })
+        }
+        guard trackedPlayers.count == TrackingConstants.playerLabels.count else { return }
+
+        rallyAnalysisQueue.async {
+            if self.rallyMotionState.stillnessAnchorPlayers.count != trackedPlayers.count {
+                self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
+                self.rallyMotionState.stillnessStartedAt = timestamp
+                return
+            }
+
+            let isStill = self.playersAreStillRelativeToAnchorLocked(trackedPlayers)
+            if !isStill {
+                self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
+                self.rallyMotionState.stillnessStartedAt = timestamp
+                if self.currentRallyState == .start {
+                    self.rallyMotionState.detectedLargeMovementSinceStart = true
+                }
+                return
+            }
+
+            if self.rallyMotionState.stillnessStartedAt == nil {
+                self.rallyMotionState.stillnessStartedAt = timestamp
+            }
+
+            let stillnessStartedAt = self.rallyMotionState.stillnessStartedAt ?? timestamp
+            guard (timestamp - stillnessStartedAt) >= RallyDetectionConstants.stillnessDuration else {
+                return
+            }
+
+            switch self.currentRallyState {
+            case .end:
+                self.rallyMotionState.detectedLargeMovementSinceStart = false
+                self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
+                self.rallyMotionState.stillnessStartedAt = timestamp
+                DispatchQueue.main.async {
+                    self.transitionRallyState(to: .start, playFeedback: false)
+                }
+            case .start:
+                guard self.rallyMotionState.detectedLargeMovementSinceStart else { return }
+                self.rallyMotionState.detectedLargeMovementSinceStart = false
+                self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
+                self.rallyMotionState.stillnessStartedAt = timestamp
+                DispatchQueue.main.async {
+                    self.transitionRallyState(to: .end, playFeedback: true)
+                }
+            }
+        }
+    }
+
+    private func playersAreStillRelativeToAnchorLocked(_ players: [TrackedPlayerBox]) -> Bool {
+        let anchorLookup = Dictionary(uniqueKeysWithValues: rallyMotionState.stillnessAnchorPlayers.map { ($0.id, $0) })
+
+        for player in players {
+            guard let anchorPlayer = anchorLookup[player.id] else {
+                return false
+            }
+
+            let centerShift = hypot(
+                player.boundingBox.midX - anchorPlayer.boundingBox.midX,
+                player.boundingBox.midY - anchorPlayer.boundingBox.midY
+            )
+            let widthShift = abs(player.boundingBox.width - anchorPlayer.boundingBox.width)
+            let heightShift = abs(player.boundingBox.height - anchorPlayer.boundingBox.height)
+
+            if centerShift > RallyDetectionConstants.maximumStillCenterShift ||
+                widthShift > RallyDetectionConstants.maximumStillSizeShift ||
+                heightShift > RallyDetectionConstants.maximumStillSizeShift {
+                return false
+            }
+        }
+
+        return true
+    }
+
     private func isAudioFeedbackMuted() -> Bool {
         let now = CACurrentMediaTime()
         return rallyAnalysisQueue.sync {
@@ -3582,7 +4070,10 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                         selectedCandidates: boundingBoxes.count,
                         players: []
                     )
+                    updateRallyStateFromPlayerMovement(with: [], timestamp: timestamp)
+                    appendRecordedTrackFrame(time: timestamp, players: [])
                 } else if !latestTrackedPlayers.isEmpty {
+                    updateRallyStateFromPlayerMovement(with: latestTrackedPlayers, timestamp: timestamp)
                     updateTrackedPlayers(latestTrackedPlayers)
                     updateTrackingDebugInfo(
                         source: detectionResult.source,
@@ -3591,6 +4082,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                         selectedCandidates: boundingBoxes.count,
                         players: latestTrackedPlayers
                     )
+                    appendRecordedTrackFrame(time: timestamp, players: latestTrackedPlayers)
                 } else {
                     updateTrackingDebugInfo(
                         source: detectionResult.source,
@@ -3599,6 +4091,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                         selectedCandidates: boundingBoxes.count,
                         players: []
                     )
+                    updateRallyStateFromPlayerMovement(with: [], timestamp: timestamp)
+                    appendRecordedTrackFrame(time: timestamp, players: [])
                 }
                 return
             }
@@ -3607,6 +4101,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             let players = associatedPlayers(from: boundingBoxes, previousPlayers: latestTrackedPlayers)
             let smoothedPlayers = smoothedPlayers(from: players)
             let annotatedPlayers = annotatePlayers(smoothedPlayers)
+            updateRallyStateFromPlayerMovement(with: annotatedPlayers, timestamp: timestamp)
             updateRallyFeedbackTracking(with: annotatedPlayers, timestamp: timestamp)
             updateTrackingRequests(from: annotatedPlayers)
             updateTrackedPlayers(annotatedPlayers)
@@ -3617,6 +4112,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 selectedCandidates: boundingBoxes.count,
                 players: annotatedPlayers
             )
+            appendRecordedTrackFrame(time: timestamp, players: annotatedPlayers)
         } catch {
             print("Failed to detect live players: \(error)")
             updateTrackingDebugInfo(
@@ -3626,6 +4122,8 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 selectedCandidates: 0,
                 players: latestTrackedPlayers
             )
+            updateRallyStateFromPlayerMovement(with: latestTrackedPlayers, timestamp: timestamp)
+            appendRecordedTrackFrame(time: timestamp, players: latestTrackedPlayers)
         }
     }
 
@@ -3755,45 +4253,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 transitionRallyState(to: .end, playFeedback: false)
             }
             return
-        }
-
-        let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds
-        guard timestamp.isFinite, let level = audioPeakLevel(from: sampleBuffer) else { return }
-
-        if isAudioFeedbackMuted() {
-            smoothedAudioLevel = 0
-            audioFloorLevel = 0.01
-            lastImpactTimestamp = timestamp
-            lastAudioTimestamp = timestamp
-            return
-        }
-
-        let smoothing = RallyDetectionConstants.levelSmoothingFactor
-        smoothedAudioLevel = (smoothedAudioLevel * (1 - smoothing)) + (level * smoothing)
-        audioFloorLevel = max(
-            0.003,
-            (audioFloorLevel * (1 - RallyDetectionConstants.floorAdaptationFactor)) + (smoothedAudioLevel * RallyDetectionConstants.floorAdaptationFactor)
-        )
-        lastAudioTimestamp = timestamp
-
-        let dynamicThreshold = max(
-            RallyDetectionConstants.minimumImpactLevel,
-            audioFloorLevel * RallyDetectionConstants.dynamicThresholdMultiplier
-        )
-        let isImpact = smoothedAudioLevel > dynamicThreshold &&
-            (timestamp - lastImpactTimestamp) >= RallyDetectionConstants.impactCooldown
-
-        if isImpact {
-            lastImpactTimestamp = timestamp
-            if rallyStateSnapshot() != .start {
-                transitionRallyState(to: .start, playFeedback: false)
-            }
-            return
-        }
-
-        if rallyStateSnapshot() == .start,
-           (timestamp - lastImpactTimestamp) >= RallyDetectionConstants.rallyEndSilenceWindow {
-            transitionRallyState(to: .end, playFeedback: true)
         }
     }
 
@@ -4141,6 +4600,20 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         }
     }
 
+    private func appendRecordedTrackFrame(time: Double, players: [TrackedPlayerBox]) {
+        guard isRecording, time.isFinite else { return }
+        let normalizedTime: Double
+        if let recordingStartTime {
+            normalizedTime = max(time - recordingStartTime.seconds, 0)
+        } else if let firstRecordedTime = recordedTrackFrames.first?.time {
+            normalizedTime = max(time - firstRecordedTime, 0)
+        } else {
+            normalizedTime = 0
+        }
+
+        recordedTrackFrames.append(PlayerTrackFrame(time: normalizedTime, players: players))
+    }
+
     private func appendFrameToRecording(_ sampleBuffer: CMSampleBuffer) {
         guard isRecording else { return }
         guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
@@ -4177,6 +4650,26 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
         if shouldStopRecording {
             finishRecording()
+        }
+    }
+
+    private func writeTrackingSidecarIfNeeded() -> URL? {
+        guard let recordingTrackingDataURL else { return nil }
+
+        let sidecar = TrackingSidecarFile(
+            frames: recordedTrackFrames.map(TrackingSidecarFrame.init)
+        )
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted]
+            let data = try encoder.encode(sidecar)
+            try data.write(to: recordingTrackingDataURL, options: .atomic)
+            return recordingTrackingDataURL
+        } catch {
+            print("Failed to write tracking sidecar: \(error)")
+            try? FileManager.default.removeItem(at: recordingTrackingDataURL)
+            return nil
         }
     }
 
@@ -4387,7 +4880,13 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             self.sessionQueue.async {
                 let status = assetWriter.status
                 if status == .completed, shouldSave, let recordingURL {
-                    self.finishStoppingSession(with: recordingURL)
+                    let trackingDataURL = self.writeTrackingSidecarIfNeeded()
+                    self.finishStoppingSession(
+                        with: RecordedSessionOutput(
+                            videoURL: recordingURL,
+                            trackingDataURL: trackingDataURL
+                        )
+                    )
                 } else {
                     if let error = assetWriter.error {
                         print("Failed to finish writing video: \(error)")
@@ -4395,6 +4894,9 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
                     if let recordingURL {
                         try? FileManager.default.removeItem(at: recordingURL)
+                    }
+                    if let trackingDataURL = self.recordingTrackingDataURL {
+                        try? FileManager.default.removeItem(at: trackingDataURL)
                     }
                     self.finishStoppingSession(with: nil)
                 }
