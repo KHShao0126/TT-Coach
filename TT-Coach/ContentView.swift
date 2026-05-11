@@ -2640,14 +2640,6 @@ struct VideoReviewScreen: View {
                     .frame(maxWidth: .infinity)
                     .aspectRatio(presentationInfo.aspectRatio, contentMode: .fit)
                     .clipShape(RoundedRectangle(cornerRadius: 24))
-                    .overlay(alignment: .topLeading) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            if let currentFrame = currentReviewFrame {
-                                ReviewFrameSummary(frame: currentFrame)
-                            }
-                        }
-                        .padding(16)
-                    }
 
                     reviewPlaybackControls
 
@@ -2657,7 +2649,6 @@ struct VideoReviewScreen: View {
                         reviewSummary(session: session)
                         reviewSuggestionList(session: session)
                         reviewEventList(session: session)
-                        reviewTrackPreview(session: session)
                     } else {
                         Text(localized(appLanguage, zh: "正在建立 review 資料模型與事件點。", en: "Building the review model and event markers."))
                             .font(.subheadline)
@@ -3470,9 +3461,9 @@ struct ReviewCourtMapView: View {
             let outerRect = viewBounds.insetBy(dx: 18, dy: 18)
             let tableRect = CGRect(
                 x: outerRect.minX + (outerRect.width * 0.19),
-                y: outerRect.minY + 6,
+                y: viewBounds.minY,
                 width: outerRect.width * 0.62,
-                height: outerRect.height * 0.23
+                height: outerRect.height * 0.24
             )
             let playerZoneRect = CGRect(
                 x: outerRect.minX + (outerRect.width * 0.015),
@@ -3513,10 +3504,36 @@ struct ReviewCourtMapView: View {
                 }
                 .stroke(Color.white.opacity(0.95), lineWidth: 2)
 
+                Path { path in
+                    let insetX = tableRect.width * 0.04
+                    let netY = tableRect.minY + 1.5
+                    path.move(to: CGPoint(x: tableRect.minX + insetX, y: netY))
+                    path.addLine(to: CGPoint(x: tableRect.maxX - insetX, y: netY))
+                }
+                .stroke(Color.white.opacity(0.98), lineWidth: 3)
+
+                Path { path in
+                    let insetX = tableRect.width * 0.04
+                    let startX = tableRect.minX + insetX
+                    let endX = tableRect.maxX - insetX
+                    let netY = tableRect.minY + 1.5
+                    let netDepth: CGFloat = 7
+                    let segmentWidth: CGFloat = 10
+                    var x = startX
+
+                    while x < endX {
+                        let nextX = min(x + segmentWidth, endX)
+                        path.move(to: CGPoint(x: x, y: netY))
+                        path.addLine(to: CGPoint(x: nextX, y: netY + netDepth))
+                        x += segmentWidth * 0.9
+                    }
+                }
+                .stroke(Color.white.opacity(0.55), lineWidth: 1.2)
+
                 Text("Table")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.95))
-                    .position(x: tableRect.midX, y: tableRect.minY - 4)
+                    .position(x: tableRect.midX, y: tableRect.maxY - 10)
 
                 RoundedRectangle(cornerRadius: 24)
                     .fill(Color.white.opacity(0.08))
