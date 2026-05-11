@@ -369,7 +369,7 @@ struct ContentView: View {
     private var calibrationStatusLabel: String {
         isCalibrationComplete
             ? localized(appLanguage, zh: "已標定", en: "Calibrated")
-            : localized(appLanguage, zh: "第 \(calibrationPoints.count)/4 點", en: "Point \(calibrationPoints.count)/4")
+            : localized(appLanguage, zh: "第 \(calibrationPoints.count)/3 點", en: "Point \(calibrationPoints.count)/3")
     }
 
     private var recordingBadgeLabel: String {
@@ -394,16 +394,16 @@ struct ContentView: View {
 
     private var calibrationHeadline: String {
         if let nextCorner = CalibrationCorner(rawValue: calibrationPoints.count) {
-            return localized(appLanguage, zh: "請點選跑動區域的\(nextCorner.title(in: appLanguage))", en: "Tap the \(nextCorner.title(in: appLanguage)) corner of the movement zone")
+            return localized(appLanguage, zh: "請點選球桌前緣的\(nextCorner.title(in: appLanguage))", en: "Tap the \(nextCorner.title(in: appLanguage)) point on the table front edge")
         }
-        return localized(appLanguage, zh: "跑動區域標定完成", en: "Movement Zone Calibration Complete")
+        return localized(appLanguage, zh: "球桌前緣標定完成", en: "Table Front Edge Calibration Complete")
     }
 
     private var calibrationDetail: String {
         if isCalibrationComplete {
-            return localized(appLanguage, zh: "已建立 normalized 跑動區域座標，可開始錄影。", en: "Normalized movement-zone coordinates are ready. Recording can start.")
+            return localized(appLanguage, zh: "已建立以球桌前緣為基準的座標，可開始錄影。", en: "The table-front coordinate system is ready. Recording can start.")
         }
-        return localized(appLanguage, zh: "依序點選左上、右上、右下、左下四個角，系統會用這個區域估算球員左右、前後與站位漏洞。", en: "Tap the top-left, top-right, bottom-right, and bottom-left corners in order. The app uses this area to estimate left-right spacing, front-back depth, and positioning gaps.")
+        return localized(appLanguage, zh: "依序點選球桌前緣最左點、中間點、最右點。中間點會是座標 0,0；左點是 -1,0；右點是 1,0，左右點也會作為擊球區邊界。", en: "Tap the left point, center point, and right point along the table front edge. The center becomes coordinate 0,0; the left point is -1,0; and the right point is 1,0. The left and right points also define the hitting-zone boundaries.")
     }
 
     private func syncRecordingState(forLandscape isLandscape: Bool) {
@@ -433,7 +433,7 @@ struct ContentView: View {
 
     private func handleCalibrationTap(_ capturePoint: CGPoint) {
         guard !cameraManager.isRecordingActive else { return }
-        guard calibrationPoints.count < 4 else { return }
+        guard calibrationPoints.count < 3 else { return }
 
         let clampedPoint = CGPoint(
             x: min(max(capturePoint.x, 0), 1),
@@ -547,10 +547,10 @@ private func fallbackCourtMapPoint(for boundingBox: CGRect) -> CGPoint {
     // Review-mode videos do not have a calibrated player-area homography, so
     // apply a simple perspective compensation to place players closer to the
     // table when they appear higher in the camera frame.
-    let adjustedDepth = pow(footPoint.y, 2.35)
+    let adjustedDepth = pow(footPoint.y, 2.1) * 1.6
     return CGPoint(
-        x: footPoint.x,
-        y: min(max(adjustedDepth, 0), 1)
+        x: (footPoint.x - 0.5) * 2.4,
+        y: max(adjustedDepth, 0)
     )
 }
 
@@ -669,21 +669,18 @@ private final class RallyFeedbackSpeaker {
 }
 
 enum CalibrationCorner: Int, CaseIterable {
-    case topLeft
-    case topRight
-    case bottomRight
-    case bottomLeft
+    case leftEdge
+    case center
+    case rightEdge
 
     fileprivate func title(in language: AppLanguage) -> String {
         switch self {
-        case .topLeft:
-            return localized(language, zh: "左上", en: "top-left")
-        case .topRight:
-            return localized(language, zh: "右上", en: "top-right")
-        case .bottomRight:
-            return localized(language, zh: "右下", en: "bottom-right")
-        case .bottomLeft:
-            return localized(language, zh: "左下", en: "bottom-left")
+        case .leftEdge:
+            return localized(language, zh: "最左點", en: "left point")
+        case .center:
+            return localized(language, zh: "中間點", en: "center point")
+        case .rightEdge:
+            return localized(language, zh: "最右點", en: "right point")
         }
     }
 }
@@ -697,113 +694,49 @@ struct PlayerAreaSpatialStatus {
 }
 
 struct PlayerAreaCalibration: Equatable, Hashable {
-    let topLeft: CGPoint
-    let topRight: CGPoint
-    let bottomRight: CGPoint
-    let bottomLeft: CGPoint
-    private let homographyCoefficients: [Double]
+    let leftPoint: CGPoint
+    let centerPoint: CGPoint
+    let rightPoint: CGPoint
+    private let axisX: CGPoint
+    private let axisY: CGPoint
+    private let halfWidth: CGFloat
 
     init?(points: [CGPoint]) {
-        guard points.count == 4 else { return nil }
-        self.init(topLeft: points[0], topRight: points[1], bottomRight: points[2], bottomLeft: points[3])
+        guard points.count == 3 else { return nil }
+        self.init(leftPoint: points[0], centerPoint: points[1], rightPoint: points[2])
     }
 
-    init?(topLeft: CGPoint, topRight: CGPoint, bottomRight: CGPoint, bottomLeft: CGPoint) {
-        let source = [topLeft, topRight, bottomRight, bottomLeft]
-        let destination = [
-            CGPoint(x: 0, y: 0),
-            CGPoint(x: 1, y: 0),
-            CGPoint(x: 1, y: 1),
-            CGPoint(x: 0, y: 1)
-        ]
+    init?(leftPoint: CGPoint, centerPoint: CGPoint, rightPoint: CGPoint) {
+        let spanVector = CGPoint(x: rightPoint.x - leftPoint.x, y: rightPoint.y - leftPoint.y)
+        let spanLength = hypot(spanVector.x, spanVector.y)
+        guard spanLength > 0.0001 else { return nil }
 
-        guard let coefficients = Self.solveHomography(source: source, destination: destination) else { return nil }
+        let normalizedAxisX = CGPoint(x: spanVector.x / spanLength, y: spanVector.y / spanLength)
+        let candidateNormalA = CGPoint(x: -normalizedAxisX.y, y: normalizedAxisX.x)
+        let candidateNormalB = CGPoint(x: normalizedAxisX.y, y: -normalizedAxisX.x)
+        let chosenAxisY = candidateNormalA.y >= candidateNormalB.y ? candidateNormalA : candidateNormalB
 
-        self.topLeft = topLeft
-        self.topRight = topRight
-        self.bottomRight = bottomRight
-        self.bottomLeft = bottomLeft
-        self.homographyCoefficients = coefficients
+        self.leftPoint = leftPoint
+        self.centerPoint = centerPoint
+        self.rightPoint = rightPoint
+        self.axisX = normalizedAxisX
+        self.axisY = chosenAxisY
+        self.halfWidth = spanLength / 2
     }
 
     var orderedPoints: [CGPoint] {
-        [topLeft, topRight, bottomRight, bottomLeft]
+        [leftPoint, centerPoint, rightPoint]
     }
 
     func normalizedPoint(forCapturePoint point: CGPoint) -> CGPoint? {
-        guard homographyCoefficients.count == 8 else { return nil }
+        guard halfWidth > 0.0001 else { return nil }
 
-        let x = Double(point.x)
-        let y = Double(point.y)
-        let denominator = (homographyCoefficients[6] * x) + (homographyCoefficients[7] * y) + 1
-        guard abs(denominator) > 0.000001 else { return nil }
-
-        let mappedX = ((homographyCoefficients[0] * x) + (homographyCoefficients[1] * y) + homographyCoefficients[2]) / denominator
-        let mappedY = ((homographyCoefficients[3] * x) + (homographyCoefficients[4] * y) + homographyCoefficients[5]) / denominator
+        let delta = CGPoint(x: point.x - centerPoint.x, y: point.y - centerPoint.y)
+        let mappedX = ((delta.x * axisX.x) + (delta.y * axisX.y)) / halfWidth
+        let mappedY = max(((delta.x * axisY.x) + (delta.y * axisY.y)) / halfWidth, 0)
 
         guard mappedX.isFinite, mappedY.isFinite else { return nil }
         return CGPoint(x: mappedX, y: mappedY)
-    }
-
-    private static func solveHomography(source: [CGPoint], destination: [CGPoint]) -> [Double]? {
-        guard source.count == 4, destination.count == 4 else { return nil }
-
-        var matrix = Array(repeating: Array(repeating: 0.0, count: 9), count: 8)
-
-        for index in 0..<4 {
-            let sourcePoint = source[index]
-            let destinationPoint = destination[index]
-
-            let x = Double(sourcePoint.x)
-            let y = Double(sourcePoint.y)
-            let u = Double(destinationPoint.x)
-            let v = Double(destinationPoint.y)
-
-            matrix[index * 2] = [x, y, 1, 0, 0, 0, -(u * x), -(u * y), u]
-            matrix[(index * 2) + 1] = [0, 0, 0, x, y, 1, -(v * x), -(v * y), v]
-        }
-
-        return solveLinearSystem(matrix)
-    }
-
-    private static func solveLinearSystem(_ augmentedMatrix: [[Double]]) -> [Double]? {
-        var matrix = augmentedMatrix
-        let dimension = 8
-
-        for pivotIndex in 0..<dimension {
-            var bestRow = pivotIndex
-            var bestValue = abs(matrix[pivotIndex][pivotIndex])
-
-            for row in (pivotIndex + 1)..<dimension {
-                let candidate = abs(matrix[row][pivotIndex])
-                if candidate > bestValue {
-                    bestValue = candidate
-                    bestRow = row
-                }
-            }
-
-            guard bestValue > 0.0000001 else { return nil }
-
-            if bestRow != pivotIndex {
-                matrix.swapAt(bestRow, pivotIndex)
-            }
-
-            let pivot = matrix[pivotIndex][pivotIndex]
-            for column in pivotIndex...dimension {
-                matrix[pivotIndex][column] /= pivot
-            }
-
-            for row in 0..<dimension where row != pivotIndex {
-                let factor = matrix[row][pivotIndex]
-                guard factor != 0 else { continue }
-
-                for column in pivotIndex...dimension {
-                    matrix[row][column] -= factor * matrix[pivotIndex][column]
-                }
-            }
-        }
-
-        return (0..<dimension).map { matrix[$0][dimension] }
     }
 }
 
@@ -1145,11 +1078,10 @@ private extension TrackedPlayerBox {
 }
 
 struct MovementEvent: Identifiable, Hashable {
-    enum Kind: String, Hashable {
-        case closeSpacing
-        case wideSpacing
-        case crossover
-        case deepRetreat
+    enum Kind: String, Hashable, CaseIterable {
+        case wrongExitDirection
+        case missingWaitingRecovery
+        case failedToClearHittingZone
     }
 
     let id = UUID()
@@ -1178,11 +1110,64 @@ struct ReviewSuggestion: Identifiable, Hashable {
 
 enum VideoReviewAnalyzer {
     private enum ReviewConstants {
-        static let closeSpacingThreshold: CGFloat = 0.14
-        static let wideSpacingThreshold: CGFloat = 0.4
-        static let retreatDropThreshold: CGFloat = 0.12
         static let minimumEventDuration: Double = 0.35
         static let samplingStride = 2
+        static let hittingZoneMaxY: CGFloat = 0.3
+        static let exitZoneMaxY: CGFloat = 0.56
+        static let waitingZoneMinY: CGFloat = 0.34
+        static let hittingZoneOverstayDuration: Double = 0.85
+        static let wrongExitDecisionDelay: Double = 0.3
+        static let exitZoneOverstayDuration: Double = 1.2
+    }
+
+    private enum HittingSide {
+        case left
+        case right
+
+        var exitDirectionLabel: String {
+            switch self {
+            case .left:
+                return "左邊"
+            case .right:
+                return "右邊"
+            }
+        }
+
+        var exitSuggestionTitle: String {
+            switch self {
+            case .left:
+                return "往左退出"
+            case .right:
+                return "往右退出"
+            }
+        }
+    }
+
+    private enum CourtRoleZone {
+        case hitting
+        case exit
+        case waiting
+        case other
+    }
+
+    private struct PlayerReviewPhase {
+        let side: HittingSide
+        let hittingZoneEnteredAt: Double
+        var leftHittingZoneAt: Double?
+        var enteredExitZoneAt: Double?
+    }
+
+    private struct EventKey: Hashable {
+        let kind: MovementEvent.Kind
+        let playerLabel: String
+    }
+
+    private struct ActiveReviewEventInterval {
+        let key: EventKey
+        let startedAt: Double
+        var lastSeenAt: Double
+        var latestCandidate: EventCandidate
+        var confidenceSamples: [Double]
     }
 
     static func analyze(video: SavedVideo) async -> ReviewSession {
@@ -1330,87 +1315,264 @@ enum VideoReviewAnalyzer {
     }
 
     private static func buildMovementEvents(from frames: [PlayerTrackFrame]) -> [MovementEvent] {
-        let pairedFrames = frames.compactMap { frame -> (PlayerTrackFrame, TrackedPlayerBox, TrackedPlayerBox)? in
-            guard
-                let player1 = frame.players.first(where: { $0.label == "Player1" }),
-                let player2 = frame.players.first(where: { $0.label == "Player2" })
-            else {
-                return nil
-            }
-
-            return (frame, player1, player2)
-        }
-
-        guard !pairedFrames.isEmpty else { return [] }
-
-        let baselinePlayer1Y = median(of: pairedFrames.map { $0.1.boundingBox.midY })
-        let baselinePlayer2Y = median(of: pairedFrames.map { $0.2.boundingBox.midY })
+        let smoothedFrames = filteredCourtMapFrames(from: frames)
+        guard !smoothedFrames.isEmpty else { return [] }
 
         var events: [MovementEvent] = []
-        events += collectIntervalEvents(from: pairedFrames) { frame, player1, player2 in
-            let spacing = abs(player1.boundingBox.midX - player2.boundingBox.midX)
-            guard spacing < ReviewConstants.closeSpacingThreshold else { return nil }
+        var activeIntervals: [EventKey: ActiveReviewEventInterval] = [:]
+        var reviewPhases: [String: PlayerReviewPhase] = [:]
 
-            let confidence = 1 - min(Double(spacing / ReviewConstants.closeSpacingThreshold), 1)
-            return EventCandidate(
-                kind: .closeSpacing,
-                playerLabel: nil,
-                confidence: confidence,
-                title: "站位過近",
-                detail: "兩位球員在 \(timeLabel(frame.time)) 左右站位太近，容易互相卡位。"
+        func appendEvent(
+            key: EventKey,
+            startTime: Double,
+            endTime: Double,
+            candidate: EventCandidate,
+            confidenceSamples: [Double]
+        ) {
+            guard endTime - startTime >= ReviewConstants.minimumEventDuration else { return }
+            let averagedConfidence = confidenceSamples.isEmpty
+                ? candidate.confidence
+                : confidenceSamples.reduce(0, +) / Double(confidenceSamples.count)
+            events.append(
+                MovementEvent(
+                    kind: key.kind,
+                    startTime: startTime,
+                    endTime: endTime,
+                    playerLabel: candidate.playerLabel,
+                    confidence: averagedConfidence,
+                    title: candidate.title,
+                    detail: candidate.detail
+                )
             )
         }
 
-        events += collectIntervalEvents(from: pairedFrames) { frame, player1, player2 in
-            let spacing = abs(player1.boundingBox.midX - player2.boundingBox.midX)
-            guard spacing > ReviewConstants.wideSpacingThreshold else { return nil }
-
-            let confidence = min(Double((spacing - ReviewConstants.wideSpacingThreshold) / 0.18), 1)
-            return EventCandidate(
-                kind: .wideSpacing,
-                playerLabel: nil,
-                confidence: confidence,
-                title: "站位過開",
-                detail: "兩位球員在 \(timeLabel(frame.time)) 左右拉得太開，中路容易出現空檔。"
+        func deactivateEvent(_ key: EventKey, at time: Double) {
+            guard let activeInterval = activeIntervals.removeValue(forKey: key) else { return }
+            appendEvent(
+                key: key,
+                startTime: activeInterval.startedAt,
+                endTime: activeInterval.lastSeenAt,
+                candidate: activeInterval.latestCandidate,
+                confidenceSamples: activeInterval.confidenceSamples
             )
         }
 
-        events += collectIntervalEvents(from: pairedFrames) { frame, player1, player2 in
-            guard player1.boundingBox.midX > player2.boundingBox.midX else { return nil }
+        func setEventActive(_ candidate: EventCandidate, playerLabel: String, isActive: Bool, time: Double) {
+            let key = EventKey(kind: candidate.kind, playerLabel: playerLabel)
 
-            let overlap = Double(player1.boundingBox.midX - player2.boundingBox.midX)
-            return EventCandidate(
-                kind: .crossover,
-                playerLabel: nil,
-                confidence: min(overlap / 0.12, 1),
-                title: "左右交叉",
-                detail: "在 \(timeLabel(frame.time)) 前後，Player1 與 Player2 的左右站位發生交叉。"
-            )
+            if isActive {
+                if var activeInterval = activeIntervals[key] {
+                    activeInterval.lastSeenAt = time
+                    activeInterval.latestCandidate = candidate
+                    activeInterval.confidenceSamples.append(candidate.confidence)
+                    activeIntervals[key] = activeInterval
+                } else {
+                    activeIntervals[key] = ActiveReviewEventInterval(
+                        key: key,
+                        startedAt: time,
+                        lastSeenAt: time,
+                        latestCandidate: candidate,
+                        confidenceSamples: [candidate.confidence]
+                    )
+                }
+            } else {
+                deactivateEvent(key, at: time)
+            }
         }
 
-        events += collectIntervalEvents(from: pairedFrames) { frame, player1, _ in
-            let retreatAmount = baselinePlayer1Y - player1.boundingBox.midY
-            guard retreatAmount > ReviewConstants.retreatDropThreshold else { return nil }
-
-            return EventCandidate(
-                kind: .deepRetreat,
-                playerLabel: "Player1",
-                confidence: min(Double(retreatAmount / 0.22), 1),
-                title: "Player1 退太深",
-                detail: "Player1 在 \(timeLabel(frame.time)) 附近明顯往後退，可能影響下一板補位。"
-            )
+        func deactivateAllEvents(for playerLabel: String, at time: Double) {
+            for kind in MovementEvent.Kind.allCases {
+                deactivateEvent(EventKey(kind: kind, playerLabel: playerLabel), at: time)
+            }
         }
 
-        events += collectIntervalEvents(from: pairedFrames) { frame, _, player2 in
-            let retreatAmount = baselinePlayer2Y - player2.boundingBox.midY
-            guard retreatAmount > ReviewConstants.retreatDropThreshold else { return nil }
+        for frame in smoothedFrames {
+            let playerLookup = Dictionary(uniqueKeysWithValues: frame.players.map { ($0.id, $0) })
+            let hitterID = reviewHitterID(in: frame)
 
-            return EventCandidate(
-                kind: .deepRetreat,
-                playerLabel: "Player2",
-                confidence: min(Double(retreatAmount / 0.22), 1),
-                title: "Player2 退太深",
-                detail: "Player2 在 \(timeLabel(frame.time)) 附近明顯往後退，可能影響下一板補位。"
+            for playerLabel in ["Player1", "Player2"] {
+                guard
+                    let player = playerLookup[playerLabel],
+                    let point = player.playerAreaPoint
+                else {
+                    deactivateAllEvents(for: playerLabel, at: frame.time)
+                    reviewPhases.removeValue(forKey: playerLabel)
+                    continue
+                }
+
+                let playerSide = hittingSide(for: point)
+                if hitterID == playerLabel, reviewZone(for: point, side: playerSide) == .hitting {
+                    if let currentPhase = reviewPhases[playerLabel],
+                       currentPhase.side == playerSide,
+                       currentPhase.leftHittingZoneAt == nil {
+                        // Continue the same hitting sequence.
+                    } else {
+                        reviewPhases[playerLabel] = PlayerReviewPhase(
+                            side: playerSide,
+                            hittingZoneEnteredAt: frame.time,
+                            leftHittingZoneAt: nil,
+                            enteredExitZoneAt: nil
+                        )
+                    }
+                }
+
+                guard var phase = reviewPhases[playerLabel] else {
+                    deactivateAllEvents(for: playerLabel, at: frame.time)
+                    continue
+                }
+
+                let zone = reviewZone(for: point, side: phase.side)
+                var wrongExitCandidate: EventCandidate?
+                var waitingCandidate: EventCandidate?
+                var noClearCandidate: EventCandidate?
+
+                if zone == .hitting {
+                    let dwellDuration = frame.time - phase.hittingZoneEnteredAt
+                    if dwellDuration >= ReviewConstants.hittingZoneOverstayDuration {
+                        let confidence = min(
+                            max(
+                                (dwellDuration - ReviewConstants.hittingZoneOverstayDuration) / 1.0,
+                                0.45
+                            ),
+                            1
+                        )
+                        noClearCandidate = EventCandidate(
+                            kind: .failedToClearHittingZone,
+                            playerLabel: playerLabel,
+                            confidence: confidence,
+                            title: "\(playerLabel) 擊球完沒有讓開",
+                            detail: "\(playerLabel) 在 \(timeLabel(phase.hittingZoneEnteredAt)) 到 \(timeLabel(frame.time)) 之間持續停在擊球區，擊球後沒有及時讓開前場。"
+                        )
+                    }
+                } else {
+                    if phase.leftHittingZoneAt == nil {
+                        phase.leftHittingZoneAt = frame.time
+                    }
+
+                    switch zone {
+                    case .waiting:
+                        if phase.enteredExitZoneAt == nil, let leftTime = phase.leftHittingZoneAt {
+                            let wrongDuration = frame.time - leftTime
+                            if wrongDuration >= ReviewConstants.wrongExitDecisionDelay {
+                                appendEvent(
+                                    key: EventKey(kind: .wrongExitDirection, playerLabel: playerLabel),
+                                    startTime: leftTime,
+                                    endTime: frame.time,
+                                    candidate: wrongExitDirectionCandidate(for: playerLabel, side: phase.side, startTime: leftTime, endTime: frame.time),
+                                    confidenceSamples: [0.9]
+                                )
+                            }
+                        }
+                        deactivateAllEvents(for: playerLabel, at: frame.time)
+                        reviewPhases.removeValue(forKey: playerLabel)
+                        continue
+                    case .exit:
+                        if phase.enteredExitZoneAt == nil {
+                            phase.enteredExitZoneAt = frame.time
+                        }
+                        let exitDuration = frame.time - (phase.enteredExitZoneAt ?? frame.time)
+                        if exitDuration >= ReviewConstants.exitZoneOverstayDuration {
+                            let confidence = min(
+                                max(
+                                    (exitDuration - ReviewConstants.exitZoneOverstayDuration) / 1.2,
+                                    0.45
+                                ),
+                                1
+                            )
+                            waitingCandidate = EventCandidate(
+                                kind: .missingWaitingRecovery,
+                                playerLabel: playerLabel,
+                                confidence: confidence,
+                                title: "\(playerLabel) 沒有等待補位",
+                                detail: "\(playerLabel) 在 \(timeLabel(phase.enteredExitZoneAt ?? frame.time)) 到 \(timeLabel(frame.time)) 之間持續停在擊球後退出區，沒有回到後方等待補位區。"
+                            )
+                        }
+                    case .other:
+                        if let leftTime = phase.leftHittingZoneAt {
+                            let wrongDuration = frame.time - leftTime
+                            if wrongDuration >= ReviewConstants.wrongExitDecisionDelay {
+                                let confidence = min(
+                                    max(
+                                        (wrongDuration - ReviewConstants.wrongExitDecisionDelay) / 0.8,
+                                        0.45
+                                    ),
+                                    1
+                                )
+                                wrongExitCandidate = wrongExitDirectionCandidate(
+                                    for: playerLabel,
+                                    side: phase.side,
+                                    startTime: leftTime,
+                                    endTime: frame.time,
+                                    confidence: confidence
+                                )
+                            }
+                        }
+                    case .hitting:
+                        break
+                    }
+                }
+
+                reviewPhases[playerLabel] = phase
+                if let wrongExitCandidate {
+                    setEventActive(wrongExitCandidate, playerLabel: playerLabel, isActive: true, time: frame.time)
+                } else {
+                    setEventActive(
+                        wrongExitDirectionCandidate(
+                            for: playerLabel,
+                            side: phase.side,
+                            startTime: phase.leftHittingZoneAt ?? frame.time,
+                            endTime: frame.time,
+                            confidence: 0.45
+                        ),
+                        playerLabel: playerLabel,
+                        isActive: false,
+                        time: frame.time
+                    )
+                }
+
+                if let waitingCandidate {
+                    setEventActive(waitingCandidate, playerLabel: playerLabel, isActive: true, time: frame.time)
+                } else {
+                    setEventActive(
+                        EventCandidate(
+                            kind: .missingWaitingRecovery,
+                            playerLabel: playerLabel,
+                            confidence: 0.45,
+                            title: "\(playerLabel) 沒有等待補位",
+                            detail: "\(playerLabel) 在退出後沒有及時回到等待補位區。"
+                        ),
+                        playerLabel: playerLabel,
+                        isActive: false,
+                        time: frame.time
+                    )
+                }
+
+                if let noClearCandidate {
+                    setEventActive(noClearCandidate, playerLabel: playerLabel, isActive: true, time: frame.time)
+                } else {
+                    setEventActive(
+                        EventCandidate(
+                            kind: .failedToClearHittingZone,
+                            playerLabel: playerLabel,
+                            confidence: 0.45,
+                            title: "\(playerLabel) 擊球完沒有讓開",
+                            detail: "\(playerLabel) 擊球後在前場停留過久。"
+                        ),
+                        playerLabel: playerLabel,
+                        isActive: false,
+                        time: frame.time
+                    )
+                }
+            }
+        }
+
+        for activeInterval in activeIntervals.values {
+            appendEvent(
+                key: activeInterval.key,
+                startTime: activeInterval.startedAt,
+                endTime: activeInterval.lastSeenAt,
+                candidate: activeInterval.latestCandidate,
+                confidenceSamples: activeInterval.confidenceSamples
             )
         }
 
@@ -1442,29 +1604,116 @@ enum VideoReviewAnalyzer {
 
     private static func suggestionTitle(for event: MovementEvent) -> String {
         switch event.kind {
-        case .closeSpacing:
-            return "拉開站位"
-        case .wideSpacing:
-            return "補回中路"
-        case .crossover:
-            return "重新分工左右區"
-        case .deepRetreat:
-            return "\(event.playerLabel ?? "球員") 先回到準備位"
+        case .wrongExitDirection:
+            return exitDirectionSuggestionTitle(for: event)
+        case .missingWaitingRecovery:
+            return "\(event.playerLabel ?? "球員") 先回等待補位區"
+        case .failedToClearHittingZone:
+            return "\(event.playerLabel ?? "球員") 擊球後先讓開"
         }
     }
 
     private static func suggestionText(for event: MovementEvent) -> String {
         switch event.kind {
-        case .closeSpacing:
-            return "AI 建議在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間，兩位球員各自再拉開半步，避免同時擠進同一條線，讓下一板補位更順。"
-        case .wideSpacing:
-            return "AI 建議在 \(timeLabel(event.startTime)) 附近優先補回中路，不要讓左右距離持續過大，否則中間來球會需要額外跨步補救。"
-        case .crossover:
-            return "AI 建議在 \(timeLabel(event.startTime)) 前後盡快重新建立左右分工。交叉後若沒有立刻換位完成，下一板容易出現判斷遲疑。"
-        case .deepRetreat:
+        case .wrongExitDirection:
             let player = event.playerLabel ?? "該球員"
-            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間不要退太深，擊球後要更快回到中性準備位，保留下一板往前補位的空間。"
+            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間，離開擊球區後先往正確的退出方向移動，再往後回到等待補位區。"
+        case .missingWaitingRecovery:
+            let player = event.playerLabel ?? "該球員"
+            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間不要一直停在擊球後退出區，完成退出後要盡快回到後方等待補位區。"
+        case .failedToClearHittingZone:
+            let player = event.playerLabel ?? "該球員"
+            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間擊球後更快離開前場擊球區，讓出下一板的進入路線。"
         }
+    }
+
+    private static func reviewHitterID(in frame: PlayerTrackFrame) -> String? {
+        if let hitter = frame.players.first(where: \.isCurrentHitter) {
+            return hitter.id
+        }
+
+        return frame.players
+            .filter { $0.playerAreaPoint != nil }
+            .min { lhs, rhs in
+                guard
+                    let lhsPoint = lhs.playerAreaPoint,
+                    let rhsPoint = rhs.playerAreaPoint
+                else {
+                    return false
+                }
+                return lhsPoint.y < rhsPoint.y
+            }?
+            .id
+    }
+
+    private static func hittingSide(for point: CGPoint) -> HittingSide {
+        point.x < 0 ? .left : .right
+    }
+
+    private static func reviewZone(for point: CGPoint, side: HittingSide) -> CourtRoleZone {
+        if hittingZoneRect(for: side).contains(point) {
+            return .hitting
+        }
+        if waitingZoneRect(for: side).contains(point) {
+            return .waiting
+        }
+        if exitZoneRect(for: side).contains(point) {
+            return .exit
+        }
+        return .other
+    }
+
+    private static func hittingZoneRect(for side: HittingSide) -> CGRect {
+        switch side {
+        case .left:
+            return CGRect(x: -1.0, y: 0.0, width: 1.0, height: ReviewConstants.hittingZoneMaxY)
+        case .right:
+            return CGRect(x: 0.0, y: 0.0, width: 1.0, height: ReviewConstants.hittingZoneMaxY)
+        }
+    }
+
+    private static func exitZoneRect(for side: HittingSide) -> CGRect {
+        switch side {
+        case .left:
+            return CGRect(x: -1.6, y: 0.0, width: 0.6, height: ReviewConstants.exitZoneMaxY)
+        case .right:
+            return CGRect(x: 1.0, y: 0.0, width: 0.6, height: ReviewConstants.exitZoneMaxY)
+        }
+    }
+
+    private static func waitingZoneRect(for side: HittingSide) -> CGRect {
+        switch side {
+        case .left:
+            return CGRect(x: -1.2, y: ReviewConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+        case .right:
+            return CGRect(x: -0.1, y: ReviewConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+        }
+    }
+
+    private static func wrongExitDirectionCandidate(
+        for playerLabel: String,
+        side: HittingSide,
+        startTime: Double,
+        endTime: Double,
+        confidence: Double = 0.8
+    ) -> EventCandidate {
+        EventCandidate(
+            kind: .wrongExitDirection,
+            playerLabel: playerLabel,
+            confidence: confidence,
+            title: "\(playerLabel) 退錯邊",
+            detail: "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間離開擊球區後，沒有先往\(side.exitDirectionLabel)的擊球後退出區移動。"
+        )
+    }
+
+    private static func exitDirectionSuggestionTitle(for event: MovementEvent) -> String {
+        guard let detailRange = event.detail.range(of: "往左") ?? event.detail.range(of: "左邊") else {
+            if event.detail.contains("右") {
+                return "往右退出"
+            }
+            return "先退到正確方向"
+        }
+        return event.detail[detailRange].contains("左") ? "往左退出" : "往右退出"
     }
 
     private static func matchingScore(previousPlayers: [TrackedPlayerBox], candidates: [TrackedPlayerBox]) -> CGFloat {
@@ -1483,87 +1732,6 @@ enum VideoReviewAnalyzer {
         let confidence: Double
         let title: String
         let detail: String
-    }
-
-    private static func collectIntervalEvents(
-        from frames: [(PlayerTrackFrame, TrackedPlayerBox, TrackedPlayerBox)],
-        detector: (PlayerTrackFrame, TrackedPlayerBox, TrackedPlayerBox) -> EventCandidate?
-    ) -> [MovementEvent] {
-        var events: [MovementEvent] = []
-        var activeStart: Double?
-        var activeEnd: Double?
-        var activeCandidate: EventCandidate?
-        var accumulatedConfidence = 0.0
-        var confidenceSamples = 0
-
-        func flushActiveEvent() {
-            guard
-                let startTime = activeStart,
-                let endTime = activeEnd,
-                let candidate = activeCandidate,
-                endTime - startTime >= ReviewConstants.minimumEventDuration
-            else {
-                activeStart = nil
-                activeEnd = nil
-                activeCandidate = nil
-                accumulatedConfidence = 0
-                confidenceSamples = 0
-                return
-            }
-
-            let averagedConfidence = confidenceSamples > 0 ? accumulatedConfidence / Double(confidenceSamples) : candidate.confidence
-            events.append(
-                MovementEvent(
-                    kind: candidate.kind,
-                    startTime: startTime,
-                    endTime: endTime,
-                    playerLabel: candidate.playerLabel,
-                    confidence: averagedConfidence,
-                    title: candidate.title,
-                    detail: candidate.detail
-                )
-            )
-
-            activeStart = nil
-            activeEnd = nil
-            activeCandidate = nil
-            accumulatedConfidence = 0
-            confidenceSamples = 0
-        }
-
-        for (frame, player1, player2) in frames {
-            if let candidate = detector(frame, player1, player2) {
-                if activeCandidate?.kind == candidate.kind, activeCandidate?.playerLabel == candidate.playerLabel {
-                    activeEnd = frame.time
-                    activeCandidate = candidate
-                    accumulatedConfidence += candidate.confidence
-                    confidenceSamples += 1
-                } else {
-                    flushActiveEvent()
-                    activeStart = frame.time
-                    activeEnd = frame.time
-                    activeCandidate = candidate
-                    accumulatedConfidence = candidate.confidence
-                    confidenceSamples = 1
-                }
-            } else {
-                flushActiveEvent()
-            }
-        }
-
-        flushActiveEvent()
-        return events
-    }
-
-    private static func median(of values: [CGFloat]) -> CGFloat {
-        let sortedValues = values.sorted()
-        guard !sortedValues.isEmpty else { return 0 }
-        let middleIndex = sortedValues.count / 2
-        if sortedValues.count.isMultiple(of: 2) {
-            return (sortedValues[middleIndex - 1] + sortedValues[middleIndex]) / 2
-        } else {
-            return sortedValues[middleIndex]
-        }
     }
 
     private static func timeLabel(_ seconds: Double) -> String {
@@ -2407,8 +2575,10 @@ struct VideoReviewScreen: View {
         session?.movementEvents.first(where: { currentTime >= $0.startTime && currentTime <= $0.endTime })
     }
 
-    private var activeSuggestion: ReviewSuggestion? {
-        session?.suggestions.first(where: { currentTime >= $0.timeRange.lowerBound && currentTime <= $0.timeRange.upperBound })
+    private var displayedSuggestion: ReviewSuggestion? {
+        session?.suggestions
+            .filter { $0.timeRange.lowerBound <= currentTime }
+            .max(by: { $0.timeRange.lowerBound < $1.timeRange.lowerBound })
     }
 
     private var selectedMapEvent: MovementEvent? {
@@ -2418,15 +2588,15 @@ struct VideoReviewScreen: View {
         return activeEvent
     }
 
-    @ViewBuilder
     private func activeReviewInsight() -> some View {
-        if let activeSuggestion {
-            ActiveReviewSuggestionCard(suggestion: activeSuggestion)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else if let activeEvent {
-            ActiveMovementEventCard(event: activeEvent)
-                .frame(maxWidth: .infinity, alignment: .leading)
+        Group {
+            if let displayedSuggestion {
+                ActiveReviewSuggestionCard(suggestion: displayedSuggestion)
+            } else {
+                ReviewSuggestionPlaceholderCard()
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var reviewPlaybackControls: some View {
@@ -2895,6 +3065,43 @@ struct ActiveReviewSuggestionCard: View {
     }
 }
 
+struct ReviewSuggestionPlaceholderCard: View {
+    @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
+
+    private var appLanguage: AppLanguage {
+        AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(localized(appLanguage, zh: "AI 建議", en: "AI Suggestion"))
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.82))
+
+                Spacer()
+
+                Text(localized(appLanguage, zh: "等待中", en: "Waiting"))
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.14), in: Capsule())
+                    .foregroundStyle(.white)
+            }
+
+            Text(localized(appLanguage, zh: "尚未出現 feedback", en: "No Feedback Yet"))
+                .font(.headline)
+                .foregroundStyle(.white)
+
+            Text(localized(appLanguage, zh: "這個區塊會固定顯示。當影片跑到第一個 feedback 時，內容會更新；之後會維持目前建議，直到下一個 feedback 出現。", en: "This panel stays visible. It will update when the first feedback appears, then keep the current suggestion until the next feedback shows up."))
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.94))
+        }
+        .padding(12)
+        .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
 struct ReviewTimelineView: View {
     let duration: Double
     let currentTime: Double
@@ -3296,9 +3503,14 @@ struct ReviewCourtMapView: View {
     }
 
     private func mappedPosition(for point: CGPoint, in rect: CGRect) -> CGPoint {
-        CGPoint(
-            x: rect.minX + (point.x * rect.width),
-            y: rect.minY + (point.y * rect.height)
+        let horizontalRange: CGFloat = 1.6
+        let verticalRange: CGFloat = 2.2
+        let normalizedX = min(max((point.x + horizontalRange) / (horizontalRange * 2), 0), 1)
+        let normalizedY = min(max(point.y / verticalRange, 0), 1)
+
+        return CGPoint(
+            x: rect.minX + (normalizedX * rect.width),
+            y: rect.minY + (normalizedY * rect.height)
         )
     }
 }
@@ -3324,27 +3536,23 @@ struct CourtMapLegendChip: View {
 extension MovementEvent {
     var tintColor: Color {
         switch kind {
-        case .closeSpacing:
-            return .orange
-        case .wideSpacing:
+        case .wrongExitDirection:
+            return .red
+        case .missingWaitingRecovery:
             return .blue
-        case .crossover:
-            return .pink
-        case .deepRetreat:
-            return .green
+        case .failedToClearHittingZone:
+            return .orange
         }
     }
 
     var kindLabel: String {
         switch kind {
-        case .closeSpacing:
-            return "站位過近"
-        case .wideSpacing:
-            return "站位過開"
-        case .crossover:
-            return "左右交叉"
-        case .deepRetreat:
-            return "退太深"
+        case .wrongExitDirection:
+            return "退錯邊"
+        case .missingWaitingRecovery:
+            return "沒有等待補位"
+        case .failedToClearHittingZone:
+            return "擊球完沒有讓開"
         }
     }
 }
@@ -3352,27 +3560,23 @@ extension MovementEvent {
 extension ReviewSuggestion {
     var tintColor: Color {
         switch eventKind {
-        case .closeSpacing:
-            return .orange
-        case .wideSpacing:
+        case .wrongExitDirection:
+            return .red
+        case .missingWaitingRecovery:
             return .blue
-        case .crossover:
-            return .pink
-        case .deepRetreat:
-            return .green
+        case .failedToClearHittingZone:
+            return .orange
         }
     }
 
     var eventKindLabel: String {
         switch eventKind {
-        case .closeSpacing:
-            return "站位過近"
-        case .wideSpacing:
-            return "站位過開"
-        case .crossover:
-            return "左右交叉"
-        case .deepRetreat:
-            return "退太深"
+        case .wrongExitDirection:
+            return "退錯邊"
+        case .missingWaitingRecovery:
+            return "沒有等待補位"
+        case .failedToClearHittingZone:
+            return "擊球完沒有讓開"
         }
     }
 }
@@ -4472,9 +4676,9 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
     private func lateralPositionLabel(for point: CGPoint) -> String {
         switch point.x {
-        case ..<0.33:
+        case ..<(-0.33):
             return "left"
-        case 0.67...:
+        case 0.33...:
             return "right"
         default:
             return "center"
@@ -4483,9 +4687,9 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
     private func depthPositionLabel(for point: CGPoint) -> String {
         switch point.y {
-        case ..<0.33:
+        case ..<0.45:
             return "front"
-        case 0.67...:
+        case 1.15...:
             return "back"
         default:
             return "mid"
@@ -4515,22 +4719,22 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         let horizontalGap = abs(mappedPlayers[0].x - mappedPlayers[1].x)
         let spacingSummary: String
         switch horizontalGap {
-        case ..<0.18:
+        case ..<0.35:
             spacingSummary = "間距過近"
-        case 0.42...:
+        case 1.35...:
             spacingSummary = "間距過大"
         default:
             spacingSummary = "間距正常"
         }
 
         let holeSummary: String
-        if mappedPlayers.allSatisfy({ $0.x < 0.45 }) {
+        if mappedPlayers.allSatisfy({ $0.x < -0.2 }) {
             holeSummary = "右側站位漏洞"
-        } else if mappedPlayers.allSatisfy({ $0.x > 0.55 }) {
+        } else if mappedPlayers.allSatisfy({ $0.x > 0.2 }) {
             holeSummary = "左側站位漏洞"
         } else if mappedPlayers.allSatisfy({ $0.y < 0.45 }) {
             holeSummary = "後場站位漏洞"
-        } else if mappedPlayers.allSatisfy({ $0.y > 0.55 }) {
+        } else if mappedPlayers.allSatisfy({ $0.y > 1.05 }) {
             holeSummary = "前場站位漏洞"
         } else {
             holeSummary = "未偵測到明顯漏洞"
@@ -5127,9 +5331,6 @@ final class PreviewView: UIView {
             path.move(to: firstPoint)
             for point in layerPoints.dropFirst() {
                 path.addLine(to: point)
-            }
-            if completedCalibration != nil, layerPoints.count == 4 {
-                path.close()
             }
         }
 
