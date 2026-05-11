@@ -584,6 +584,124 @@ private func selectNearestTwoPlayerBoxes(from boundingBoxes: [CGRect]) -> [CGRec
     )
 }
 
+private struct StableAssignmentCandidate {
+    let players: [TrackedPlayerBox]
+    let score: CGFloat
+}
+
+private func stablePlayerInitialization(from boundingBoxes: [CGRect]) -> [TrackedPlayerBox] {
+    zip(
+        boundingBoxes.sorted { $0.midX < $1.midX }.prefix(2),
+        ["Player1", "Player2"]
+    ).map { boundingBox, label in
+        TrackedPlayerBox(id: label, label: label, boundingBox: boundingBox)
+    }
+}
+
+private func trackingCenterDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+    hypot(lhs.midX - rhs.midX, lhs.midY - rhs.midY)
+}
+
+private func trackingIoU(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+    let intersection = lhs.intersection(rhs)
+    let intersectionArea = max(intersection.width, 0) * max(intersection.height, 0)
+    let unionArea = (lhs.width * lhs.height) + (rhs.width * rhs.height) - intersectionArea
+    return unionArea > 0 ? intersectionArea / unionArea : 0
+}
+
+private func playerTrackingContinuityScore(previous: CGRect, candidate: CGRect) -> CGFloat {
+    let centerDistance = trackingCenterDistance(previous, candidate)
+    let distanceScore = max(0, 1 - (centerDistance / 0.28))
+    let iouScore = trackingIoU(previous, candidate)
+    let areaDelta = abs((previous.width * previous.height) - (candidate.width * candidate.height))
+    let areaScore = max(0, 1 - (areaDelta / 0.08))
+    return (distanceScore * 0.55) + (iouScore * 0.3) + (areaScore * 0.15)
+}
+
+private func shouldLockPlayerIdentities(previousPlayers: [TrackedPlayerBox], candidateBoxes: [CGRect]) -> Bool {
+    guard previousPlayers.count == 2, candidateBoxes.count == 2 else { return false }
+
+    let previousSpacing = abs(previousPlayers[0].boundingBox.midX - previousPlayers[1].boundingBox.midX)
+    let candidateSpacing = abs(candidateBoxes[0].midX - candidateBoxes[1].midX)
+    let overlapAmount = max(
+        min(candidateBoxes[0].maxX, candidateBoxes[1].maxX) - max(candidateBoxes[0].minX, candidateBoxes[1].minX),
+        0
+    )
+    let closeInteraction = candidateSpacing < 0.16 || previousSpacing < 0.16 || overlapAmount > 0.025
+
+    let keepOrderScore = playerTrackingContinuityScore(previous: previousPlayers[0].boundingBox, candidate: candidateBoxes[0]) +
+        playerTrackingContinuityScore(previous: previousPlayers[1].boundingBox, candidate: candidateBoxes[1])
+    let swapOrderScore = playerTrackingContinuityScore(previous: previousPlayers[0].boundingBox, candidate: candidateBoxes[1]) +
+        playerTrackingContinuityScore(previous: previousPlayers[1].boundingBox, candidate: candidateBoxes[0])
+
+    return closeInteraction && abs(keepOrderScore - swapOrderScore) < 0.18
+}
+
+private func stableTrackedPlayers(
+    previousPlayers: [TrackedPlayerBox],
+    candidateBoxes: [CGRect]
+) -> [TrackedPlayerBox] {
+    let sortedCandidates = Array(candidateBoxes.sorted { $0.midX < $1.midX }.prefix(2))
+
+    guard previousPlayers.count == 2 else {
+        return stablePlayerInitialization(from: sortedCandidates)
+    }
+
+    guard !sortedCandidates.isEmpty else {
+        return previousPlayers
+    }
+
+    if sortedCandidates.count == 1 {
+        let onlyCandidate = sortedCandidates[0]
+        let matchedPlayer = previousPlayers.max {
+            playerTrackingContinuityScore(previous: $0.boundingBox, candidate: onlyCandidate) <
+                playerTrackingContinuityScore(previous: $1.boundingBox, candidate: onlyCandidate)
+        }
+
+        return previousPlayers.map { previousPlayer in
+            guard previousPlayer.id == matchedPlayer?.id else { return previousPlayer }
+            let continuityScore = playerTrackingContinuityScore(previous: previousPlayer.boundingBox, candidate: onlyCandidate)
+            if continuityScore < 0.2 {
+                return previousPlayer
+            }
+            return TrackedPlayerBox(id: previousPlayer.id, label: previousPlayer.label, boundingBox: onlyCandidate)
+        }
+    }
+
+    if shouldLockPlayerIdentities(previousPlayers: previousPlayers, candidateBoxes: sortedCandidates) {
+        return previousPlayers
+    }
+
+    let assignmentOrders = [
+        [sortedCandidates[0], sortedCandidates[1]],
+        [sortedCandidates[1], sortedCandidates[0]]
+    ]
+
+    let rankedAssignments = assignmentOrders.map { orderedBoxes -> StableAssignmentCandidate in
+        let assignedPlayers = zip(previousPlayers, orderedBoxes).map { previousPlayer, candidateBox in
+            TrackedPlayerBox(id: previousPlayer.id, label: previousPlayer.label, boundingBox: candidateBox)
+        }
+        let score = zip(previousPlayers, orderedBoxes).reduce(CGFloat.zero) { partial, pair in
+            partial + playerTrackingContinuityScore(previous: pair.0.boundingBox, candidate: pair.1)
+        }
+        return StableAssignmentCandidate(players: assignedPlayers, score: score)
+    }
+
+    let bestAssignment = rankedAssignments.max { $0.score < $1.score } ?? rankedAssignments[0]
+
+    return zip(previousPlayers, bestAssignment.players).map { previousPlayer, assignedPlayer in
+        let continuityScore = playerTrackingContinuityScore(previous: previousPlayer.boundingBox, candidate: assignedPlayer.boundingBox)
+        let jumpDistance = trackingCenterDistance(previousPlayer.boundingBox, assignedPlayer.boundingBox)
+        let candidateIoU = trackingIoU(previousPlayer.boundingBox, assignedPlayer.boundingBox)
+
+        if continuityScore < 0.16 || (jumpDistance > 0.32 && candidateIoU < 0.03) {
+            return previousPlayer
+        }
+
+        return assignedPlayer
+    }
+}
+
 struct TrackingDebugInfo {
     var source = "none"
     var rectangleCandidates = 0
@@ -1283,31 +1401,18 @@ enum VideoReviewAnalyzer {
                 from: (request.results ?? []).map(\.boundingBox)
             )
 
-            let detectedPlayers = selectedBoxes.enumerated().map { index, boundingBox in
-                let label = index == 0 ? "Player1" : "Player2"
-                let footPoint = normalizedPlayerFootPoint(for: boundingBox)
-                let courtMapPoint = fallbackCourtMapPoint(for: boundingBox)
+            let trackedPlayers = stableTrackedPlayers(previousPlayers: previousPlayers, candidateBoxes: selectedBoxes)
+            return trackedPlayers.map { trackedPlayer in
+                let footPoint = normalizedPlayerFootPoint(for: trackedPlayer.boundingBox)
+                let courtMapPoint = fallbackCourtMapPoint(for: trackedPlayer.boundingBox)
                 return TrackedPlayerBox(
-                    id: label,
-                    label: label,
-                    boundingBox: boundingBox,
+                    id: trackedPlayer.id,
+                    label: trackedPlayer.label,
+                    boundingBox: trackedPlayer.boundingBox,
                     footPoint: footPoint,
                     playerAreaPoint: courtMapPoint
                 )
             }
-
-            guard previousPlayers.count == 2, detectedPlayers.count == 2 else {
-                return Array(detectedPlayers)
-            }
-
-            let firstOrderScore = matchingScore(previousPlayers: previousPlayers, candidates: detectedPlayers)
-            let swappedCandidates = [
-                TrackedPlayerBox(id: "Player1", label: "Player1", boundingBox: detectedPlayers[1].boundingBox),
-                TrackedPlayerBox(id: "Player2", label: "Player2", boundingBox: detectedPlayers[0].boundingBox)
-            ]
-            let swappedOrderScore = matchingScore(previousPlayers: previousPlayers, candidates: swappedCandidates)
-
-            return firstOrderScore >= swappedOrderScore ? Array(detectedPlayers) : swappedCandidates
         } catch {
             print("Failed to analyze review frame: \(error)")
             return []
@@ -1714,16 +1819,6 @@ enum VideoReviewAnalyzer {
             return "先退到正確方向"
         }
         return event.detail[detailRange].contains("左") ? "往左退出" : "往右退出"
-    }
-
-    private static func matchingScore(previousPlayers: [TrackedPlayerBox], candidates: [TrackedPlayerBox]) -> CGFloat {
-        zip(previousPlayers, candidates).reduce(0) { partialResult, pair in
-            let centerDistance = hypot(
-                pair.0.boundingBox.midX - pair.1.boundingBox.midX,
-                pair.0.boundingBox.midY - pair.1.boundingBox.midY
-            )
-            return partialResult + (1 - min(centerDistance, 1))
-        }
     }
 
     private struct EventCandidate {
@@ -4534,75 +4629,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         from boundingBoxes: [CGRect],
         previousPlayers: [TrackedPlayerBox]
     ) -> [TrackedPlayerBox] {
-        guard previousPlayers.count == TrackingConstants.playerLabels.count else {
-            return zip(boundingBoxes.prefix(TrackingConstants.playerLabels.count), TrackingConstants.playerLabels).map { boundingBox, label in
-                TrackedPlayerBox(id: label, label: label, boundingBox: boundingBox)
-            }
-        }
-
-        let candidateBoxes = boundingBoxes
-        var usedIndices = Set<Int>()
-        var associatedPlayers: [TrackedPlayerBox] = []
-
-        for previousPlayer in previousPlayers {
-            let bestMatch = candidateBoxes.enumerated()
-                .filter { !usedIndices.contains($0.offset) }
-                .map { index, box in
-                    (index, trackingMatchScore(previous: previousPlayer.boundingBox, candidate: box))
-                }
-                .max { $0.1 < $1.1 }
-
-            if
-                let bestMatch,
-                bestMatch.1 > 0
-            {
-                usedIndices.insert(bestMatch.0)
-                associatedPlayers.append(
-                    TrackedPlayerBox(
-                        id: previousPlayer.id,
-                        label: previousPlayer.label,
-                        boundingBox: candidateBoxes[bestMatch.0]
-                    )
-                )
-            }
-        }
-
-        let unmatchedBoxes = candidateBoxes.enumerated()
-            .filter { !usedIndices.contains($0.offset) }
-            .map(\.element)
-            .sorted { $0.midX < $1.midX }
-
-        let missingLabels = TrackingConstants.playerLabels.filter { label in
-            !associatedPlayers.contains(where: { $0.label == label })
-        }
-
-        for (box, label) in zip(unmatchedBoxes, missingLabels) {
-            associatedPlayers.append(
-                TrackedPlayerBox(id: label, label: label, boundingBox: box)
-            )
-        }
-
-        return associatedPlayers.sorted { lhs, rhs in
-            TrackingConstants.playerLabels.firstIndex(of: lhs.label)! < TrackingConstants.playerLabels.firstIndex(of: rhs.label)!
-        }
-    }
-
-    private func trackingMatchScore(previous: CGRect, candidate: CGRect) -> CGFloat {
-        let intersection = previous.intersection(candidate)
-        let intersectionArea = max(intersection.width, 0) * max(intersection.height, 0)
-        let unionArea = (previous.width * previous.height) + (candidate.width * candidate.height) - intersectionArea
-        let iou = unionArea > 0 ? intersectionArea / unionArea : 0
-
-        let centerDistance = hypot(previous.midX - candidate.midX, previous.midY - candidate.midY)
-        guard
-            iou >= TrackingConstants.minimumIoUForMatch ||
-            centerDistance <= TrackingConstants.maximumNormalizedCenterDistance
-        else {
-            return -1
-        }
-
-        let normalizedDistanceScore = max(0, 1 - (centerDistance / TrackingConstants.maximumNormalizedCenterDistance))
-        return (iou * 0.7) + (normalizedDistanceScore * 0.3)
+        stableTrackedPlayers(previousPlayers: previousPlayers, candidateBoxes: boundingBoxes)
     }
 
     private func smoothedPlayers(from players: [TrackedPlayerBox]) -> [TrackedPlayerBox] {
