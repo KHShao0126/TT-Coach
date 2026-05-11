@@ -882,8 +882,34 @@ private struct RecordedSessionOutput {
     let trackingDataURL: URL?
 }
 
+struct RallyInterval: Identifiable, Codable, Hashable {
+    let startTime: Double
+    let endTime: Double
+
+    var id: String {
+        "\(startTime)-\(endTime)"
+    }
+}
+
 private struct TrackingSidecarFile: Codable {
     let frames: [TrackingSidecarFrame]
+    let rallyIntervals: [RallyInterval]
+
+    init(frames: [TrackingSidecarFrame], rallyIntervals: [RallyInterval]) {
+        self.frames = frames
+        self.rallyIntervals = rallyIntervals
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case frames
+        case rallyIntervals
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        frames = try container.decode([TrackingSidecarFrame].self, forKey: .frames)
+        rallyIntervals = try container.decodeIfPresent([RallyInterval].self, forKey: .rallyIntervals) ?? []
+    }
 }
 
 private struct TrackingSidecarFrame: Codable {
@@ -982,6 +1008,7 @@ struct ReviewSession {
     let video: SavedVideo
     let duration: Double
     let trackFrames: [PlayerTrackFrame]
+    let rallyIntervals: [RallyInterval]
     let movementEvents: [MovementEvent]
     let suggestions: [ReviewSuggestion]
 }
@@ -1301,12 +1328,14 @@ enum VideoReviewAnalyzer {
         let duration = normalizedDuration(from: asset.duration)
 
         if let sidecarFrames = loadTrackFramesFromSidecar(for: video) {
-            let movementEvents = buildMovementEvents(from: sidecarFrames)
+            let rallyIntervals = loadRallyIntervalsFromSidecar(for: video)
+            let movementEvents = buildMovementEvents(from: sidecarFrames, rallyIntervals: rallyIntervals)
             let suggestions = buildSuggestions(from: movementEvents)
             return ReviewSession(
                 video: video,
                 duration: duration,
                 trackFrames: sidecarFrames,
+                rallyIntervals: rallyIntervals,
                 movementEvents: movementEvents,
                 suggestions: suggestions
             )
@@ -1316,7 +1345,7 @@ enum VideoReviewAnalyzer {
             let track = asset.tracks(withMediaType: .video).first,
             let reader = try? AVAssetReader(asset: asset)
         else {
-            return ReviewSession(video: video, duration: duration, trackFrames: [], movementEvents: [], suggestions: [])
+            return ReviewSession(video: video, duration: duration, trackFrames: [], rallyIntervals: [], movementEvents: [], suggestions: [])
         }
 
         let output = AVAssetReaderTrackOutput(
@@ -1328,12 +1357,12 @@ enum VideoReviewAnalyzer {
         output.alwaysCopiesSampleData = false
 
         guard reader.canAdd(output) else {
-            return ReviewSession(video: video, duration: duration, trackFrames: [], movementEvents: [], suggestions: [])
+            return ReviewSession(video: video, duration: duration, trackFrames: [], rallyIntervals: [], movementEvents: [], suggestions: [])
         }
 
         reader.add(output)
         guard reader.startReading() else {
-            return ReviewSession(video: video, duration: duration, trackFrames: [], movementEvents: [], suggestions: [])
+            return ReviewSession(video: video, duration: duration, trackFrames: [], rallyIntervals: [], movementEvents: [], suggestions: [])
         }
 
         var trackFrames: [PlayerTrackFrame] = []
@@ -1361,12 +1390,13 @@ enum VideoReviewAnalyzer {
         }
 
         let normalizedTrackFrames = normalizedTrackFrameTimes(trackFrames)
-        let movementEvents = buildMovementEvents(from: normalizedTrackFrames)
+        let movementEvents = buildMovementEvents(from: normalizedTrackFrames, rallyIntervals: [])
         let suggestions = buildSuggestions(from: movementEvents)
         return ReviewSession(
             video: video,
             duration: duration,
             trackFrames: normalizedTrackFrames,
+            rallyIntervals: [],
             movementEvents: movementEvents,
             suggestions: suggestions
         )
@@ -1383,6 +1413,20 @@ enum VideoReviewAnalyzer {
         } catch {
             print("Failed to load tracking sidecar: \(error)")
             return nil
+        }
+    }
+
+    private static func loadRallyIntervalsFromSidecar(for video: SavedVideo) -> [RallyInterval] {
+        let sidecarURL = video.trackingDataURL
+        guard FileManager.default.fileExists(atPath: sidecarURL.path) else { return [] }
+
+        do {
+            let data = try Data(contentsOf: sidecarURL)
+            let sidecar = try JSONDecoder().decode(TrackingSidecarFile.self, from: data)
+            return sidecar.rallyIntervals
+        } catch {
+            print("Failed to load rally intervals from sidecar: \(error)")
+            return []
         }
     }
 
@@ -1419,8 +1463,11 @@ enum VideoReviewAnalyzer {
         }
     }
 
-    private static func buildMovementEvents(from frames: [PlayerTrackFrame]) -> [MovementEvent] {
-        let smoothedFrames = filteredCourtMapFrames(from: frames)
+    private static func buildMovementEvents(from frames: [PlayerTrackFrame], rallyIntervals: [RallyInterval]) -> [MovementEvent] {
+        let rallyFrames = frames.filter { frame in
+            rallyIntervals.isEmpty || rallyIntervals.contains(where: { frame.time >= $0.startTime && frame.time <= $0.endTime })
+        }
+        let smoothedFrames = filteredCourtMapFrames(from: rallyFrames)
         guard !smoothedFrames.isEmpty else { return [] }
 
         var events: [MovementEvent] = []
@@ -3422,16 +3469,16 @@ struct ReviewCourtMapView: View {
             let viewBounds = CGRect(origin: .zero, size: geometry.size)
             let outerRect = viewBounds.insetBy(dx: 18, dy: 18)
             let tableRect = CGRect(
-                x: outerRect.minX + (outerRect.width * 0.12),
-                y: outerRect.minY + 22,
-                width: outerRect.width * 0.76,
-                height: outerRect.height * 0.2
+                x: outerRect.minX + (outerRect.width * 0.19),
+                y: outerRect.minY + 6,
+                width: outerRect.width * 0.62,
+                height: outerRect.height * 0.23
             )
             let playerZoneRect = CGRect(
-                x: outerRect.minX + (outerRect.width * 0.08),
-                y: tableRect.maxY + 26,
-                width: outerRect.width * 0.84,
-                height: outerRect.maxY - tableRect.maxY - 44
+                x: outerRect.minX + (outerRect.width * 0.015),
+                y: tableRect.maxY,
+                width: outerRect.width * 0.97,
+                height: outerRect.maxY - tableRect.maxY - 18
             )
 
             ZStack {
@@ -3466,11 +3513,6 @@ struct ReviewCourtMapView: View {
                 }
                 .stroke(Color.white.opacity(0.95), lineWidth: 2)
 
-                Capsule()
-                    .fill(Color.white.opacity(0.95))
-                    .frame(width: tableRect.width + 18, height: 8)
-                    .position(x: tableRect.midX, y: tableRect.maxY + 3)
-
                 Text("Table")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.95))
@@ -3478,11 +3520,6 @@ struct ReviewCourtMapView: View {
 
                 RoundedRectangle(cornerRadius: 24)
                     .fill(Color.white.opacity(0.08))
-                    .frame(width: playerZoneRect.width, height: playerZoneRect.height)
-                    .position(x: playerZoneRect.midX, y: playerZoneRect.midY)
-
-                RoundedRectangle(cornerRadius: 24)
-                    .stroke(Color.white.opacity(0.28), style: StrokeStyle(lineWidth: 1.5, dash: [8, 6]))
                     .frame(width: playerZoneRect.width, height: playerZoneRect.height)
                     .position(x: playerZoneRect.midX, y: playerZoneRect.midY)
 
@@ -3817,6 +3854,9 @@ final class CameraManager: NSObject, ObservableObject {
     private var queuedRallyFeedback = Set<RallyFeedback>()
     private var audioFeedbackMuteUntil: CFTimeInterval = 0
     private var recordedTrackFrames: [PlayerTrackFrame] = []
+    private var recordedRallyIntervals: [RallyInterval] = []
+    private var currentRecordedRallyStartTime: Double?
+    private var lastRecordedFrameTime: Double = 0
 
     func requestPermissionAndStart(completion: @escaping (Bool) -> Void) {
         requestCapturePermissions { granted in
@@ -3863,7 +3903,7 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     func rallyEnded() {
-        transitionRallyState(to: .end, playFeedback: false)
+        transitionRallyState(to: .end, playFeedback: false, timestamp: lastRecordedFrameTime)
     }
 
     func updatePlayerAreaCalibration(_ calibration: PlayerAreaCalibration?) {
@@ -3961,6 +4001,9 @@ final class CameraManager: NSObject, ObservableObject {
         shouldStopRecording = false
         isFinishingRecording = false
         recordedTrackFrames = []
+        recordedRallyIntervals = []
+        currentRecordedRallyStartTime = nil
+        lastRecordedFrameTime = 0
         isRecording = true
         smoothedAudioLevel = 0
         audioFloorLevel = 0.01
@@ -3987,6 +4030,9 @@ final class CameraManager: NSObject, ObservableObject {
         recordingRenderSize = .zero
         recordingSourceCanvasSize = .zero
         recordedTrackFrames = []
+        recordedRallyIntervals = []
+        currentRecordedRallyStartTime = nil
+        lastRecordedFrameTime = 0
         resetRallyAnalysisState()
 
         if session.isRunning {
@@ -4073,9 +4119,17 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private func transitionRallyState(to newState: RallyState, playFeedback: Bool) {
+        transitionRallyState(to: newState, playFeedback: playFeedback, timestamp: lastRecordedFrameTime)
+    }
+
+    private func transitionRallyState(to newState: RallyState, playFeedback: Bool, timestamp: Double?) {
         let feedbackToPlay: [RallyFeedback] = rallyAnalysisQueue.sync {
             let previousState = currentRallyState
             currentRallyState = newState
+
+            if let timestamp, timestamp.isFinite {
+                self.recordRallyTransitionLocked(from: previousState, to: newState, timestamp: timestamp)
+            }
 
             switch newState {
             case .start:
@@ -4100,6 +4154,23 @@ final class CameraManager: NSObject, ObservableObject {
         let muteDuration = rallyFeedbackSpeaker.speak(feedbackToPlay)
         rallyAnalysisQueue.async {
             self.audioFeedbackMuteUntil = CACurrentMediaTime() + muteDuration
+        }
+    }
+
+    private func recordRallyTransitionLocked(from previousState: RallyState, to newState: RallyState, timestamp: Double) {
+        let normalizedTimestamp = normalizeRecordingTimestamp(timestamp)
+
+        switch (previousState, newState) {
+        case (.end, .start):
+            currentRecordedRallyStartTime = normalizedTimestamp
+        case (.start, .end):
+            if let startTime = currentRecordedRallyStartTime {
+                let endTime = max(normalizedTimestamp, startTime)
+                recordedRallyIntervals.append(RallyInterval(startTime: startTime, endTime: endTime))
+                currentRecordedRallyStartTime = nil
+            }
+        default:
+            break
         }
     }
 
@@ -4282,7 +4353,7 @@ final class CameraManager: NSObject, ObservableObject {
                 self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
                 self.rallyMotionState.stillnessStartedAt = timestamp
                 DispatchQueue.main.async {
-                    self.transitionRallyState(to: .start, playFeedback: false)
+                    self.transitionRallyState(to: .start, playFeedback: false, timestamp: timestamp)
                 }
             case .start:
                 guard self.rallyMotionState.detectedLargeMovementSinceStart else { return }
@@ -4290,7 +4361,7 @@ final class CameraManager: NSObject, ObservableObject {
                 self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
                 self.rallyMotionState.stillnessStartedAt = timestamp
                 DispatchQueue.main.async {
-                    self.transitionRallyState(to: .end, playFeedback: true)
+                    self.transitionRallyState(to: .end, playFeedback: true, timestamp: timestamp)
                 }
             }
         }
@@ -4833,16 +4904,19 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
 
     private func appendRecordedTrackFrame(time: Double, players: [TrackedPlayerBox]) {
         guard isRecording, time.isFinite else { return }
-        let normalizedTime: Double
-        if let recordingStartTime {
-            normalizedTime = max(time - recordingStartTime.seconds, 0)
-        } else if let firstRecordedTime = recordedTrackFrames.first?.time {
-            normalizedTime = max(time - firstRecordedTime, 0)
-        } else {
-            normalizedTime = 0
-        }
-
+        let normalizedTime = normalizeRecordingTimestamp(time)
+        lastRecordedFrameTime = normalizedTime
         recordedTrackFrames.append(PlayerTrackFrame(time: normalizedTime, players: players))
+    }
+
+    private func normalizeRecordingTimestamp(_ time: Double) -> Double {
+        if let recordingStartTime {
+            return max(time - recordingStartTime.seconds, 0)
+        }
+        if let firstRecordedTime = recordedTrackFrames.first?.time {
+            return max(time - firstRecordedTime, 0)
+        }
+        return max(time, 0)
     }
 
     private func appendFrameToRecording(_ sampleBuffer: CMSampleBuffer) {
@@ -4887,8 +4961,15 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
     private func writeTrackingSidecarIfNeeded() -> URL? {
         guard let recordingTrackingDataURL else { return nil }
 
+        if let startTime = currentRecordedRallyStartTime {
+            let endTime = max(lastRecordedFrameTime, startTime)
+            recordedRallyIntervals.append(RallyInterval(startTime: startTime, endTime: endTime))
+            currentRecordedRallyStartTime = nil
+        }
+
         let sidecar = TrackingSidecarFile(
-            frames: recordedTrackFrames.map(TrackingSidecarFrame.init)
+            frames: recordedTrackFrames.map(TrackingSidecarFrame.init),
+            rallyIntervals: recordedRallyIntervals
         )
 
         do {
