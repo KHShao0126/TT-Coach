@@ -264,17 +264,6 @@ struct ContentView: View {
                     .padding(.top, geometry.safeAreaInsets.top + 12)
                     .padding(.horizontal, 16)
 
-                    HStack {
-                        TrackingDebugPanel(
-                            debugInfo: cameraManager.trackingDebugInfo,
-                            rallyState: cameraManager.rallyState,
-                            spatialStatus: cameraManager.playerAreaSpatialStatus,
-                            calibrationStatus: calibrationStatusLabel
-                        )
-                        Spacer()
-                    }
-                    .padding(.horizontal, 16)
-
                     Spacer(minLength: 0)
                 }
 
@@ -3661,19 +3650,6 @@ struct ReviewCourtMapView: View {
                     .foregroundStyle(.white.opacity(0.92))
                     .position(x: playerZoneRect.midX, y: playerZoneRect.maxY + 16)
 
-                ForEach(["Player1", "Player2"], id: \.self) { playerID in
-                    let trailPath = playerTrailPath(for: playerID, in: playerZoneRect)
-                    trailPath
-                        .stroke(
-                            playerColors[playerID, default: .gray].opacity(selectedEvent == nil ? 0.5 : 0.85),
-                            style: StrokeStyle(
-                                lineWidth: selectedEvent == nil ? 4 : 5,
-                                lineCap: .round,
-                                lineJoin: .round
-                            )
-                        )
-                }
-
                 ForEach(currentPlayers, id: \.id) { player in
                     if let point = player.playerAreaPoint {
                         let position = mappedPosition(for: point, in: playerZoneRect)
@@ -3704,7 +3680,6 @@ struct ReviewCourtMapView: View {
             .frame(width: geometry.size.width, height: geometry.size.height)
             .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 28))
             .animation(.linear(duration: 0.12), value: currentPlayers)
-            .animation(.linear(duration: 0.12), value: trailFrames)
         }
     }
 
@@ -3730,29 +3705,6 @@ struct ReviewCourtMapView: View {
 
     private func playerColor(for player: TrackedPlayerBox) -> Color {
         playerColors[player.id, default: .gray]
-    }
-
-    private func playerTrailPath(for playerID: String, in rect: CGRect) -> Path {
-        let points = trailFrames.compactMap { frame -> CGPoint? in
-            guard
-                let player = frame.players.first(where: { $0.id == playerID }),
-                let playerAreaPoint = player.playerAreaPoint
-            else {
-                return nil
-            }
-
-            return mappedPosition(for: playerAreaPoint, in: rect)
-        }
-
-        var path = Path()
-        guard let firstPoint = points.first else { return path }
-
-        path.move(to: firstPoint)
-        for point in points.dropFirst() {
-            path.addLine(to: point)
-        }
-
-        return path
     }
 
     private func mappedPosition(for point: CGPoint, in rect: CGRect) -> CGPoint {
