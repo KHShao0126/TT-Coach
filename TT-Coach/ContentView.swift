@@ -47,6 +47,20 @@ enum PlayerHandednessMode: String, Codable, CaseIterable {
     }
 }
 
+enum LiveFeedbackMode: String, CaseIterable {
+    case duringRally
+    case afterRally
+
+    fileprivate func title(in language: AppLanguage) -> String {
+        switch self {
+        case .duringRally:
+            return localized(language, zh: "During rally", en: "During rally")
+        case .afterRally:
+            return localized(language, zh: "After rally", en: "After rally")
+        }
+    }
+}
+
 struct ContentView: View {
     @StateObject private var cameraManager = CameraManager()
     @StateObject private var videoLibrary = VideoLibraryManager()
@@ -61,6 +75,8 @@ struct ContentView: View {
     @State private var calibrationPoints: [CGPoint] = []
     @State private var showLanguagePicker = false
     @State private var showHandednessPicker = false
+    @State private var showFeedbackModePicker = false
+    @State private var pendingHandednessMode: PlayerHandednessMode?
 
     private var appLanguage: AppLanguage {
         AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
@@ -122,11 +138,24 @@ struct ContentView: View {
         .confirmationDialog(localized(appLanguage, zh: "請選擇球員慣用手", en: "Choose Players' Dominant Hands"), isPresented: $showHandednessPicker, titleVisibility: .visible) {
             ForEach(PlayerHandednessMode.allCases, id: \.rawValue) { mode in
                 Button(mode.title(in: appLanguage)) {
-                    startCoachingMode(with: mode)
+                    pendingHandednessMode = mode
+                    showFeedbackModePicker = true
                 }
             }
 
             Button(localized(appLanguage, zh: "取消", en: "Cancel"), role: .cancel) { }
+        }
+        .confirmationDialog(localized(appLanguage, zh: "請選擇 feedback 時機", en: "Choose Feedback Timing"), isPresented: $showFeedbackModePicker, titleVisibility: .visible) {
+            ForEach(LiveFeedbackMode.allCases, id: \.rawValue) { mode in
+                Button(mode.title(in: appLanguage)) {
+                    guard let pendingHandednessMode else { return }
+                    startCoachingMode(with: pendingHandednessMode, feedbackMode: mode)
+                }
+            }
+
+            Button(localized(appLanguage, zh: "取消", en: "Cancel"), role: .cancel) {
+                pendingHandednessMode = nil
+            }
         }
         .sheet(isPresented: $isVideoLibraryPresented) {
             SavedVideosView(videoLibrary: videoLibrary)
@@ -231,6 +260,9 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             recordingStatusBadge
                             rallyStatusBadge
+                            if cameraManager.selectedLiveFeedbackMode == .afterRally {
+                                AfterRallyDebugPanel(items: cameraManager.afterRallyDebugItems)
+                            }
                         }
 
                         Spacer()
@@ -453,9 +485,10 @@ struct ContentView: View {
         cameraManager.updatePlayerAreaCalibration(nil)
     }
 
-    private func startCoachingMode(with handednessMode: PlayerHandednessMode) {
+    private func startCoachingMode(with handednessMode: PlayerHandednessMode, feedbackMode: LiveFeedbackMode) {
         resetCalibration()
-        cameraManager.requestPermissionAndStart(handednessMode: handednessMode) { started in
+        pendingHandednessMode = nil
+        cameraManager.requestPermissionAndStart(handednessMode: handednessMode, feedbackMode: feedbackMode) { started in
             if started {
                 isCoachingMode = true
             } else {
@@ -729,6 +762,13 @@ struct TrackingDebugInfo {
     var trackedSummaries: [String] = []
 }
 
+struct AfterRallyDebugItem: Identifiable, Hashable {
+    let code: Int
+    let label: String
+
+    var id: Int { code }
+}
+
 enum RallyState: String {
     case start = "Rally start"
     case end = "Rally end"
@@ -744,30 +784,39 @@ enum RallyState: String {
 }
 
 private enum RallyFeedback: String, CaseIterable {
-    case p1RecoverEarlier = "Player 1, recover earlier."
-    case p2RecoverEarlier = "Player 2, recover earlier."
-    case p1MoveOutAfterHitting = "Player 1, move out after hitting."
-    case p2MoveOutAfterHitting = "Player 2, move out after hitting."
+    case moveLeft = "Move left."
+    case moveRight = "Move right."
+    case rallyStart = "Rally start."
+    case rallyEnd = "Rally end."
 }
 
 private final class RallyFeedbackSpeaker {
     private let synthesizer = AVSpeechSynthesizer()
 
-    @discardableResult
-    func speak(_ feedback: [RallyFeedback]) -> CFTimeInterval {
+    static func estimatedDuration(for feedback: [String]) -> CFTimeInterval {
         guard !feedback.isEmpty else { return 0 }
 
-        let estimatedDuration = (Double(feedback.count) * 2.1) + 0.4
+        let wordCount = feedback.reduce(0) { total, item in
+            total + item.split { $0.isWhitespace || $0.isNewline }.count
+        }
+        let countBasedDuration = (Double(feedback.count) * 2.1) + 0.4
+        let wordBasedDuration = (Double(wordCount) * 0.42) + 0.8
+        return max(countBasedDuration, wordBasedDuration)
+    }
+
+    @discardableResult
+    func speak(_ feedback: [String]) -> CFTimeInterval {
+        guard !feedback.isEmpty else { return 0 }
+
+        let estimatedDuration = Self.estimatedDuration(for: feedback)
 
         DispatchQueue.main.async {
             self.activateAudioSessionIfPossible()
-
             if self.synthesizer.isSpeaking {
                 self.synthesizer.stopSpeaking(at: .immediate)
             }
-
             for item in feedback {
-                let utterance = AVSpeechUtterance(string: item.rawValue)
+                let utterance = AVSpeechUtterance(string: item)
                 utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
                 utterance.rate = 0.48
                 utterance.pitchMultiplier = 0.95
@@ -3141,6 +3190,37 @@ struct VideoReviewScreen: View {
     }
 }
 
+struct AfterRallyDebugPanel: View {
+    let items: [AfterRallyDebugItem]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("After Rally Debug")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.white)
+
+            if items.isEmpty {
+                Text("IDs: none")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.white.opacity(0.88))
+            } else {
+                Text("IDs: " + items.map { String($0.code) }.joined(separator: ", "))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.white.opacity(0.94))
+
+                ForEach(items) { item in
+                    Text(item.label)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.white.opacity(0.82))
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 12))
+    }
+}
+
 struct ReviewFrameSummary: View {
     let frame: PlayerTrackFrame
     @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
@@ -3825,7 +3905,7 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private enum RallyDetectionConstants {
-        static let stillnessDuration: Double = 3.0
+        static let stillnessDuration: Double = 2.0
         static let maximumStillCenterShift: CGFloat = 0.2
         static let maximumStillSizeShift: CGFloat = 0.08
     }
@@ -3848,9 +3928,12 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private enum RallyFeedbackConstants {
-        static let recoverCheckDelay: Double = 0.5
-        static let recoverDistanceThreshold: CGFloat = 0.22
-        static let moveOutAfterHittingDuration: Double = 1.0
+        static let directionalCueDelay: Double = 0.5
+        static let hittingZoneMaxY: CGFloat = 0.3
+        static let exitZoneMaxY: CGFloat = 0.56
+        static let hittingZoneOverstayDuration: Double = 0.5
+        static let waitingZoneMinY: CGFloat = 0.34
+        static let exitToWaitingTransitionDuration: Double = 0.35
     }
 
     let session = AVCaptureSession()
@@ -3860,6 +3943,8 @@ final class CameraManager: NSObject, ObservableObject {
     @Published private(set) var isRecordingActive = false
     @Published private(set) var rallyState: RallyState = .end
     @Published private(set) var playerAreaSpatialStatus = PlayerAreaSpatialStatus.uncalibrated
+    @Published private(set) var selectedLiveFeedbackMode: LiveFeedbackMode = .duringRally
+    @Published private(set) var afterRallyDebugItems: [AfterRallyDebugItem] = []
 
     private let videoDataOutput = AVCaptureVideoDataOutput()
     private let audioDataOutput = AVCaptureAudioDataOutput()
@@ -3880,13 +3965,44 @@ final class CameraManager: NSObject, ObservableObject {
     private struct ActiveHitterState {
         let hitterID: String
         let startedAt: Double
-        let didTriggerMoveOutFeedback: Bool
-        let isMoveOutFeedbackExempt: Bool
     }
 
-    private struct PendingRecoverCheck {
+    private enum LiveHittingSide {
+        case left
+        case right
+    }
+
+    private enum LiveCourtRoleZone {
+        case hitting
+        case correctExit
+        case wrongExit
+        case waiting
+        case other
+    }
+
+    private struct LivePlayerFeedbackPhase {
+        let side: LiveHittingSide
+        let hittingZoneEnteredAt: Double
+        var leftHittingZoneAt: Double?
+        var enteredExitZoneAt: Double?
+        var skippedExitZoneAt: Double?
+        var partnerBecameHitterAt: Double?
+    }
+
+    private struct AfterRallyFeedbackEvent: Hashable {
+        enum Kind: Hashable {
+            case hittingZoneOverstay
+            case wrongExitSide
+            case directRetreatToWaiting
+            case exitZoneOverstay
+        }
+
+        let playerID: String
+        let kind: Kind
+    }
+
+    private struct PendingDirectionalCue {
         let hitterID: String
-        let nonHitterID: String
         let dueTime: Double
     }
 
@@ -3923,8 +4039,10 @@ final class CameraManager: NSObject, ObservableObject {
     private var currentRallyState: RallyState = .end
     private var rallyMotionState = RallyMotionState()
     private var activeHitterState: ActiveHitterState?
-    private var pendingRecoverChecks: [PendingRecoverCheck] = []
-    private var queuedRallyFeedback = Set<RallyFeedback>()
+    private var pendingDirectionalCue: PendingDirectionalCue?
+    private var liveFeedbackMode: LiveFeedbackMode = .duringRally
+    private var livePlayerFeedbackPhases: [String: LivePlayerFeedbackPhase] = [:]
+    private var afterRallyFeedbackEvents = Set<AfterRallyFeedbackEvent>()
     private var audioFeedbackMuteUntil: CFTimeInterval = 0
     private var recordedTrackFrames: [PlayerTrackFrame] = []
     private var recordedRallyIntervals: [RallyInterval] = []
@@ -3932,8 +4050,13 @@ final class CameraManager: NSObject, ObservableObject {
     private var lastRecordedFrameTime: Double = 0
     private var recordingHandednessMode: PlayerHandednessMode = .rightRight
 
-    func requestPermissionAndStart(handednessMode: PlayerHandednessMode, completion: @escaping (Bool) -> Void) {
+    func requestPermissionAndStart(handednessMode: PlayerHandednessMode, feedbackMode: LiveFeedbackMode, completion: @escaping (Bool) -> Void) {
         recordingHandednessMode = handednessMode
+        liveFeedbackMode = feedbackMode
+        DispatchQueue.main.async {
+            self.selectedLiveFeedbackMode = feedbackMode
+            self.afterRallyDebugItems = []
+        }
         requestCapturePermissions { granted in
             if granted {
                 self.configureAndStartSession()
@@ -4198,8 +4321,13 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private func transitionRallyState(to newState: RallyState, playFeedback: Bool, timestamp: Double?) {
-        let feedbackToPlay: [RallyFeedback] = rallyAnalysisQueue.sync {
+        let transitionResult: (state: RallyState?, feedback: [String]) = rallyAnalysisQueue.sync {
             let previousState = currentRallyState
+            if previousState == .end, newState == .start, CACurrentMediaTime() < audioFeedbackMuteUntil {
+                rallyMotionState.stillnessStartedAt = timestamp
+                return (nil, [])
+            }
+
             currentRallyState = newState
 
             if let timestamp, timestamp.isFinite {
@@ -4210,25 +4338,41 @@ final class CameraManager: NSObject, ObservableObject {
             case .start:
                 if previousState != .start {
                     resetRallyAnalysisStateLocked()
+                    DispatchQueue.main.async {
+                        self.afterRallyDebugItems = []
+                    }
+                    return (newState, [RallyFeedback.rallyStart.rawValue])
                 }
-                return []
+                return (newState, [])
 
             case .end:
-                let feedback = playFeedback && previousState == .start
-                    ? orderedQueuedFeedbackLocked()
+                let feedback = liveFeedbackMode == .afterRally && playFeedback && previousState == .start
+                    ? afterRallyFeedbackMessagesLocked()
                     : []
                 resetRallyAnalysisStateLocked()
-                return feedback
+                if !feedback.isEmpty {
+                    audioFeedbackMuteUntil = CACurrentMediaTime() + RallyFeedbackSpeaker.estimatedDuration(for: feedback)
+                    return (newState, feedback)
+                }
+                let endCue = playFeedback && previousState == .start
+                    ? [RallyFeedback.rallyEnd.rawValue]
+                    : []
+                if !endCue.isEmpty {
+                    audioFeedbackMuteUntil = CACurrentMediaTime() + RallyFeedbackSpeaker.estimatedDuration(for: endCue)
+                }
+                return (newState, endCue)
             }
         }
 
-        updateRallyState(newState)
+        guard let transitionedState = transitionResult.state else { return }
 
+        updateRallyState(transitionedState)
+
+        let feedbackToPlay = transitionResult.feedback
         guard !feedbackToPlay.isEmpty else { return }
-
         let muteDuration = rallyFeedbackSpeaker.speak(feedbackToPlay)
         rallyAnalysisQueue.async {
-            self.audioFeedbackMuteUntil = CACurrentMediaTime() + muteDuration
+            self.audioFeedbackMuteUntil = max(self.audioFeedbackMuteUntil, CACurrentMediaTime() + muteDuration)
         }
     }
 
@@ -4252,12 +4396,21 @@ final class CameraManager: NSObject, ObservableObject {
     private func resetRallyAnalysisStateLocked() {
         rallyMotionState = RallyMotionState()
         activeHitterState = nil
-        pendingRecoverChecks = []
-        queuedRallyFeedback = []
+        pendingDirectionalCue = nil
+        livePlayerFeedbackPhases = [:]
+        afterRallyFeedbackEvents = []
     }
 
-    private func orderedQueuedFeedbackLocked() -> [RallyFeedback] {
-        RallyFeedback.allCases.filter { queuedRallyFeedback.contains($0) }
+    private func immediateExitDirectionCue(for point: CGPoint) -> RallyFeedback? {
+        guard recordingHandednessMode == .rightRight else { return nil }
+        return point.x < 0 ? .moveLeft : .moveRight
+    }
+
+    private func playImmediateFeedbackIfPossible(_ feedback: String) {
+        let muteDuration = rallyFeedbackSpeaker.speak([feedback])
+        rallyAnalysisQueue.async {
+            self.audioFeedbackMuteUntil = CACurrentMediaTime() + muteDuration
+        }
     }
 
     private func updateRallyFeedbackTracking(with players: [TrackedPlayerBox], timestamp: Double) {
@@ -4269,122 +4422,362 @@ final class CameraManager: NSObject, ObservableObject {
         rallyAnalysisQueue.async {
             guard self.currentRallyState == .start else { return }
 
-            self.resolvePendingRecoverChecksLocked(
-                using: playerLookup,
-                currentHitterID: hitterID,
-                timestamp: timestamp
-            )
+            switch self.liveFeedbackMode {
+            case .duringRally:
+                self.resolvePendingDirectionalCueLocked(
+                    using: playerLookup,
+                    currentHitterID: hitterID,
+                    timestamp: timestamp
+                )
+            case .afterRally:
+                self.updateAfterRallyFeedbackTrackingLocked(
+                    using: playerLookup,
+                    currentHitterID: hitterID,
+                    timestamp: timestamp
+                )
+            }
 
             guard
                 let hitterID,
                 playerLookup[hitterID]?.playerAreaPoint != nil,
-                let nonHitterID = playerLookup.keys.first(where: { $0 != hitterID }),
-                playerLookup[nonHitterID]?.playerAreaPoint != nil
+                playerLookup.keys.contains(where: { $0 != hitterID })
             else {
                 return
             }
 
             if let activeHitterState = self.activeHitterState {
                 if activeHitterState.hitterID != hitterID {
-                    self.pendingRecoverChecks.append(
-                        PendingRecoverCheck(
+                    self.activeHitterState = ActiveHitterState(
+                        hitterID: hitterID,
+                        startedAt: timestamp
+                    )
+                    if self.liveFeedbackMode == .duringRally {
+                        self.pendingDirectionalCue = PendingDirectionalCue(
                             hitterID: hitterID,
-                            nonHitterID: nonHitterID,
-                            dueTime: timestamp + RallyFeedbackConstants.recoverCheckDelay
+                            dueTime: timestamp + RallyFeedbackConstants.directionalCueDelay
                         )
-                    )
-                    self.activeHitterState = ActiveHitterState(
-                        hitterID: hitterID,
-                        startedAt: timestamp,
-                        didTriggerMoveOutFeedback: false,
-                        isMoveOutFeedbackExempt: false
-                    )
+                    }
                     return
-                }
-
-                if
-                    !activeHitterState.isMoveOutFeedbackExempt,
-                    !activeHitterState.didTriggerMoveOutFeedback,
-                    (timestamp - activeHitterState.startedAt) >= RallyFeedbackConstants.moveOutAfterHittingDuration
-                {
-                    self.queueMoveOutFeedbackLocked(for: hitterID)
-                    self.activeHitterState = ActiveHitterState(
-                        hitterID: hitterID,
-                        startedAt: activeHitterState.startedAt,
-                        didTriggerMoveOutFeedback: true,
-                        isMoveOutFeedbackExempt: false
-                    )
                 }
                 return
             }
 
-            self.pendingRecoverChecks.append(
-                PendingRecoverCheck(
-                    hitterID: hitterID,
-                    nonHitterID: nonHitterID,
-                    dueTime: timestamp + RallyFeedbackConstants.recoverCheckDelay
-                )
-            )
             self.activeHitterState = ActiveHitterState(
                 hitterID: hitterID,
-                startedAt: timestamp,
-                didTriggerMoveOutFeedback: false,
-                isMoveOutFeedbackExempt: true
+                startedAt: timestamp
             )
+            if self.liveFeedbackMode == .duringRally {
+                self.pendingDirectionalCue = PendingDirectionalCue(
+                    hitterID: hitterID,
+                    dueTime: timestamp + RallyFeedbackConstants.directionalCueDelay
+                )
+            }
         }
     }
 
-    private func resolvePendingRecoverChecksLocked(
+    private func spokenDirectionalCue(for feedback: RallyFeedback, playerID: String) -> String {
+        let prefix: String
+        switch playerID {
+        case "Player1":
+            prefix = "Player 1"
+        case "Player2":
+            prefix = "Player 2"
+        default:
+            prefix = "Player"
+        }
+        return "\(prefix), \(feedback.rawValue)"
+    }
+
+    private func resolvePendingDirectionalCueLocked(
         using playerLookup: [String: TrackedPlayerBox],
         currentHitterID: String?,
         timestamp: Double
     ) {
-        guard !pendingRecoverChecks.isEmpty else { return }
+        guard let pendingDirectionalCue else { return }
+        guard timestamp >= pendingDirectionalCue.dueTime else { return }
+        defer { self.pendingDirectionalCue = nil }
 
-        var remainingChecks: [PendingRecoverCheck] = []
+        guard
+            currentHitterID == pendingDirectionalCue.hitterID,
+            let hitterPoint = playerLookup[pendingDirectionalCue.hitterID]?.playerAreaPoint,
+            let exitCue = immediateExitDirectionCue(for: hitterPoint)
+        else {
+            return
+        }
 
-        for check in pendingRecoverChecks {
-            guard timestamp >= check.dueTime else {
-                remainingChecks.append(check)
-                continue
-            }
+        let directedCue = spokenDirectionalCue(for: exitCue, playerID: pendingDirectionalCue.hitterID)
+        DispatchQueue.global(qos: .userInitiated).async {
+            self.playImmediateFeedbackIfPossible(directedCue)
+        }
+    }
 
+    private func updateAfterRallyFeedbackTrackingLocked(
+        using playerLookup: [String: TrackedPlayerBox],
+        currentHitterID: String?,
+        timestamp: Double
+    ) {
+        guard recordingHandednessMode == .rightRight else {
+            livePlayerFeedbackPhases = [:]
+            afterRallyFeedbackEvents = []
+            publishAfterRallyDebugItemsLocked()
+            return
+        }
+
+        for playerID in TrackingConstants.playerLabels {
             guard
-                currentHitterID == check.hitterID,
-                let hitterPoint = playerLookup[check.hitterID]?.playerAreaPoint,
-                let nonHitterPoint = playerLookup[check.nonHitterID]?.playerAreaPoint
+                let player = playerLookup[playerID],
+                let point = player.playerAreaPoint
             else {
+                livePlayerFeedbackPhases.removeValue(forKey: playerID)
                 continue
             }
 
-            let distance = hypot(hitterPoint.x - nonHitterPoint.x, hitterPoint.y - nonHitterPoint.y)
-            if distance <= RallyFeedbackConstants.recoverDistanceThreshold {
-                queueRecoverEarlierFeedbackLocked(for: check.nonHitterID)
+            if currentHitterID == playerID {
+                let side = liveHittingSide(for: point)
+                if liveZone(for: point, side: side) == .hitting {
+                    if let phase = livePlayerFeedbackPhases[playerID],
+                       phase.side == side,
+                       phase.leftHittingZoneAt == nil {
+                        // Keep current phase.
+                    } else {
+                        livePlayerFeedbackPhases[playerID] = LivePlayerFeedbackPhase(
+                            side: side,
+                            hittingZoneEnteredAt: timestamp,
+                            leftHittingZoneAt: nil,
+                            enteredExitZoneAt: nil,
+                            skippedExitZoneAt: nil,
+                            partnerBecameHitterAt: nil
+                        )
+                    }
+                }
             }
+
+            guard var phase = livePlayerFeedbackPhases[playerID] else { continue }
+            let zone = liveZone(for: point, side: phase.side)
+
+            if currentHitterID != playerID, phase.enteredExitZoneAt != nil, phase.partnerBecameHitterAt == nil {
+                phase.partnerBecameHitterAt = timestamp
+            }
+
+            switch zone {
+            case .hitting:
+                if (timestamp - phase.hittingZoneEnteredAt) >= RallyFeedbackConstants.hittingZoneOverstayDuration {
+                    afterRallyFeedbackEvents.insert(
+                        AfterRallyFeedbackEvent(playerID: playerID, kind: .hittingZoneOverstay)
+                    )
+                }
+            case .correctExit:
+                if phase.leftHittingZoneAt == nil {
+                    phase.leftHittingZoneAt = timestamp
+                }
+                if phase.enteredExitZoneAt == nil {
+                    phase.enteredExitZoneAt = timestamp
+                }
+                if let partnerBecameHitterAt = phase.partnerBecameHitterAt,
+                   (timestamp - partnerBecameHitterAt) >= RallyFeedbackConstants.exitToWaitingTransitionDuration {
+                    afterRallyFeedbackEvents.insert(
+                        AfterRallyFeedbackEvent(playerID: playerID, kind: .exitZoneOverstay)
+                    )
+                }
+            case .wrongExit:
+                if phase.leftHittingZoneAt == nil {
+                    phase.leftHittingZoneAt = timestamp
+                }
+                afterRallyFeedbackEvents.insert(
+                    AfterRallyFeedbackEvent(playerID: playerID, kind: .wrongExitSide)
+                )
+            case .waiting:
+                if phase.leftHittingZoneAt == nil {
+                    phase.leftHittingZoneAt = timestamp
+                }
+                if phase.enteredExitZoneAt == nil, phase.skippedExitZoneAt == nil {
+                    phase.skippedExitZoneAt = timestamp
+                    afterRallyFeedbackEvents.insert(
+                        AfterRallyFeedbackEvent(playerID: playerID, kind: .directRetreatToWaiting)
+                    )
+                }
+            case .other:
+                if phase.leftHittingZoneAt == nil {
+                    phase.leftHittingZoneAt = timestamp
+                }
+            }
+
+            livePlayerFeedbackPhases[playerID] = phase
         }
 
-        pendingRecoverChecks = remainingChecks
+        publishAfterRallyDebugItemsLocked()
     }
 
-    private func queueRecoverEarlierFeedbackLocked(for playerID: String) {
-        switch playerID {
-        case "Player1":
-            queuedRallyFeedback.insert(.p1RecoverEarlier)
-        case "Player2":
-            queuedRallyFeedback.insert(.p2RecoverEarlier)
-        default:
-            break
+    private func afterRallyFeedbackMessagesLocked() -> [String] {
+        guard recordingHandednessMode == .rightRight else { return [] }
+
+        return afterRallyFeedbackEvents
+            .sorted { lhs, rhs in
+                if lhs.playerID == rhs.playerID {
+                    return afterRallyFeedbackPriority(lhs.kind) < afterRallyFeedbackPriority(rhs.kind)
+                }
+                return lhs.playerID < rhs.playerID
+            }
+            .map { event in
+                switch event.kind {
+                case .hittingZoneOverstay:
+                    return "\(spokenPlayerName(for: event.playerID)), you stayed in the hitting zone too long after the shot. Move out earlier to improve the next transition."
+                case .wrongExitSide:
+                    return "\(spokenPlayerName(for: event.playerID)), after hitting, you moved to the wrong side. Exit toward the outside of your hitting side so your partner has space to step in."
+                case .directRetreatToWaiting:
+                    return "\(spokenPlayerName(for: event.playerID)), don't move straight back after hitting. Exit to the outside first, or you will run into your partner."
+                case .exitZoneOverstay:
+                    return "\(spokenPlayerName(for: event.playerID)), don't stop on the side after rotating out. Move back earlier to reset for the next shot."
+                }
+            }
+    }
+
+    private func afterRallyDebugItemsLocked() -> [AfterRallyDebugItem] {
+        afterRallyFeedbackEvents
+            .sorted { lhs, rhs in
+                if lhs.playerID == rhs.playerID {
+                    return afterRallyFeedbackPriority(lhs.kind) < afterRallyFeedbackPriority(rhs.kind)
+                }
+                return lhs.playerID < rhs.playerID
+            }
+            .map { event in
+                AfterRallyDebugItem(
+                    code: afterRallyFeedbackCode(for: event),
+                    label: afterRallyFeedbackCodeLabel(for: event)
+                )
+            }
+    }
+
+    private func afterRallyFeedbackPriority(_ kind: AfterRallyFeedbackEvent.Kind) -> Int {
+        switch kind {
+        case .hittingZoneOverstay:
+            return 0
+        case .wrongExitSide:
+            return 1
+        case .directRetreatToWaiting:
+            return 2
+        case .exitZoneOverstay:
+            return 3
         }
     }
 
-    private func queueMoveOutFeedbackLocked(for playerID: String) {
+    private func spokenPlayerName(for playerID: String) -> String {
         switch playerID {
         case "Player1":
-            queuedRallyFeedback.insert(.p1MoveOutAfterHitting)
+            return "Player 1"
         case "Player2":
-            queuedRallyFeedback.insert(.p2MoveOutAfterHitting)
+            return "Player 2"
         default:
-            break
+            return "Player"
+        }
+    }
+
+    private func afterRallyFeedbackCode(for event: AfterRallyFeedbackEvent) -> Int {
+        switch (event.playerID, event.kind) {
+        case ("Player1", .hittingZoneOverstay):
+            return 1
+        case ("Player1", .wrongExitSide):
+            return 2
+        case ("Player1", .directRetreatToWaiting):
+            return 3
+        case ("Player1", .exitZoneOverstay):
+            return 4
+        case ("Player2", .hittingZoneOverstay):
+            return 5
+        case ("Player2", .wrongExitSide):
+            return 6
+        case ("Player2", .directRetreatToWaiting):
+            return 7
+        case ("Player2", .exitZoneOverstay):
+            return 8
+        default:
+            return 0
+        }
+    }
+
+    private func afterRallyFeedbackCodeLabel(for event: AfterRallyFeedbackEvent) -> String {
+        switch (event.playerID, event.kind) {
+        case ("Player1", .hittingZoneOverstay):
+            return "1: P1 Hitting"
+        case ("Player1", .wrongExitSide):
+            return "2: P1 Wrong Exit"
+        case ("Player1", .directRetreatToWaiting):
+            return "3: P1 Direct Back"
+        case ("Player1", .exitZoneOverstay):
+            return "4: P1 Exit"
+        case ("Player2", .hittingZoneOverstay):
+            return "5: P2 Hitting"
+        case ("Player2", .wrongExitSide):
+            return "6: P2 Wrong Exit"
+        case ("Player2", .directRetreatToWaiting):
+            return "7: P2 Direct Back"
+        case ("Player2", .exitZoneOverstay):
+            return "8: P2 Exit"
+        default:
+            return "0: Unknown"
+        }
+    }
+
+    private func publishAfterRallyDebugItemsLocked() {
+        let items = afterRallyDebugItemsLocked()
+        DispatchQueue.main.async {
+            self.afterRallyDebugItems = items
+        }
+    }
+
+    private func liveHittingSide(for point: CGPoint) -> LiveHittingSide {
+        point.x < 0 ? .left : .right
+    }
+
+    private func liveZone(for point: CGPoint, side: LiveHittingSide) -> LiveCourtRoleZone {
+        if liveHittingZoneRect(for: side).contains(point) {
+            return .hitting
+        }
+        if liveExitZoneRect(for: side).contains(point) {
+            return .correctExit
+        }
+        if liveExitZoneRect(for: oppositeSide(of: side)).contains(point) {
+            return .wrongExit
+        }
+        if liveWaitingZoneRect(for: side).contains(point) {
+            return .waiting
+        }
+        return .other
+    }
+
+    private func liveHittingZoneRect(for side: LiveHittingSide) -> CGRect {
+        switch side {
+        case .left:
+            return CGRect(x: -1.0, y: 0.0, width: 1.0, height: RallyFeedbackConstants.hittingZoneMaxY)
+        case .right:
+            return CGRect(x: 0.0, y: 0.0, width: 1.0, height: RallyFeedbackConstants.hittingZoneMaxY)
+        }
+    }
+
+    private func liveExitZoneRect(for side: LiveHittingSide) -> CGRect {
+        switch side {
+        case .left:
+            return CGRect(x: -8.0, y: 0.0, width: 7.0, height: 8.0)
+        case .right:
+            return CGRect(x: 1.0, y: 0.0, width: 7.0, height: 8.0)
+        }
+    }
+
+    private func liveWaitingZoneRect(for side: LiveHittingSide) -> CGRect {
+        switch side {
+        case .left:
+            return CGRect(x: -1.2, y: RallyFeedbackConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+        case .right:
+            return CGRect(x: -0.1, y: RallyFeedbackConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+        }
+    }
+
+    private func oppositeSide(of side: LiveHittingSide) -> LiveHittingSide {
+        switch side {
+        case .left:
+            return .right
+        case .right:
+            return .left
         }
     }
 
@@ -4397,6 +4790,12 @@ final class CameraManager: NSObject, ObservableObject {
         guard trackedPlayers.count == TrackingConstants.playerLabels.count else { return }
 
         rallyAnalysisQueue.async {
+            if self.currentRallyState == .end, CACurrentMediaTime() < self.audioFeedbackMuteUntil {
+                self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
+                self.rallyMotionState.stillnessStartedAt = timestamp
+                return
+            }
+
             if self.rallyMotionState.stillnessAnchorPlayers.count != trackedPlayers.count {
                 self.rallyMotionState.stillnessAnchorPlayers = trackedPlayers
                 self.rallyMotionState.stillnessStartedAt = timestamp
