@@ -260,6 +260,16 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 8) {
                             recordingStatusBadge
                             rallyStatusBadge
+                            if cameraManager.isRecordingActive {
+                                TrackingDebugPanel(
+                                    debugInfo: cameraManager.trackingDebugInfo,
+                                    rallyState: cameraManager.rallyState,
+                                    spatialStatus: cameraManager.playerAreaSpatialStatus,
+                                    calibrationStatus: isCalibrationComplete
+                                        ? localized(appLanguage, zh: "已完成", en: "ready")
+                                        : localized(appLanguage, zh: "未完成", en: "pending")
+                                )
+                            }
                             if cameraManager.selectedLiveFeedbackMode == .afterRally {
                                 AfterRallyDebugPanel(items: cameraManager.afterRallyDebugItems)
                             }
@@ -527,15 +537,21 @@ struct TrackingDebugPanel: View {
 
             Text("rally: \(rallyState.rawValue)")
             Text("calibration: \(calibrationStatus)")
-            Text("spacing: \(spatialStatus.spacingSummary)")
-            Text("hole: \(spatialStatus.holeSummary)")
             Text("source: \(debugInfo.source)")
             Text("rectangles: \(debugInfo.rectangleCandidates)  bodyPose: \(debugInfo.bodyPoseCandidates)")
             Text("selected: \(debugInfo.selectedCandidates)  tracked: \(debugInfo.trackedPlayers)")
             Text("missed: \(debugInfo.missedFrames)")
 
-            ForEach(debugInfo.trackedSummaries, id: \.self) { summary in
-                Text(summary)
+            Divider()
+                .background(Color.white.opacity(0.35))
+
+            if debugInfo.trackedSummaries.isEmpty {
+                Text("Player1: no point")
+                Text("Player2: no point")
+            } else {
+                ForEach(debugInfo.trackedSummaries, id: \.self) { summary in
+                    Text(summary)
+                }
             }
         }
         .font(.caption2.monospaced())
@@ -584,6 +600,22 @@ private func cameraProximityScore(for boundingBox: CGRect) -> CGFloat {
     return (footlineScore * 1.8) + (heightScore * 0.9) + (areaScore * 0.4)
 }
 
+private func isForegroundPlayerBox(_ boundingBox: CGRect, nearestFootline: CGFloat, largestHeight: CGFloat, largestArea: CGFloat) -> Bool {
+    let footline = normalizedPlayerFootPoint(for: boundingBox).y
+    let area = boundingBox.width * boundingBox.height
+    return footline >= nearestFootline - 0.12 &&
+        boundingBox.height >= largestHeight * 0.55 &&
+        area >= largestArea * 0.38
+}
+
+private func isFallbackForegroundPlayerBox(_ boundingBox: CGRect, nearestFootline: CGFloat, largestHeight: CGFloat, largestArea: CGFloat) -> Bool {
+    let footline = normalizedPlayerFootPoint(for: boundingBox).y
+    let area = boundingBox.width * boundingBox.height
+    return footline >= nearestFootline - 0.16 &&
+        boundingBox.height >= largestHeight * 0.45 &&
+        area >= largestArea * 0.28
+}
+
 private func normalizedPlayerFootPoint(for boundingBox: CGRect) -> CGPoint {
     CGPoint(
         x: min(max(boundingBox.midX, 0), 1),
@@ -605,33 +637,47 @@ private func fallbackCourtMapPoint(for boundingBox: CGRect) -> CGPoint {
 }
 
 private func selectNearestTwoPlayerBoxes(from boundingBoxes: [CGRect]) -> [CGRect] {
-    let sortedByFootline = boundingBoxes.sorted {
-        normalizedPlayerFootPoint(for: $0).y > normalizedPlayerFootPoint(for: $1).y
-    }
-
-    let filteredByFootline: [CGRect]
-    if let nearestFootline = sortedByFootline.first.map({ normalizedPlayerFootPoint(for: $0).y }) {
-        let foregroundCandidates = sortedByFootline.filter {
-            normalizedPlayerFootPoint(for: $0).y >= (nearestFootline - 0.18)
+    let sortedByProximity = boundingBoxes.sorted { lhs, rhs in
+        let lhsScore = cameraProximityScore(for: lhs)
+        let rhsScore = cameraProximityScore(for: rhs)
+        if lhsScore == rhsScore {
+            return lhs.midX < rhs.midX
         }
-        filteredByFootline = foregroundCandidates.count >= 2 ? foregroundCandidates : sortedByFootline
-    } else {
-        filteredByFootline = sortedByFootline
+        return lhsScore > rhsScore
     }
 
-    return Array(
-        filteredByFootline
-            .sorted { lhs, rhs in
-                let lhsScore = cameraProximityScore(for: lhs)
-                let rhsScore = cameraProximityScore(for: rhs)
-                if lhsScore == rhsScore {
-                    return lhs.midX < rhs.midX
-                }
-                return lhsScore > rhsScore
-            }
-            .prefix(2)
-            .sorted { $0.midX < $1.midX }
-    )
+    guard
+        let nearestFootline = sortedByProximity.first.map({ normalizedPlayerFootPoint(for: $0).y }),
+        let largestHeight = sortedByProximity.map(\.height).max(),
+        let largestArea = sortedByProximity.map({ $0.width * $0.height }).max()
+    else {
+        return []
+    }
+
+    let foregroundCandidates = sortedByProximity.filter {
+        isForegroundPlayerBox($0, nearestFootline: nearestFootline, largestHeight: largestHeight, largestArea: largestArea)
+    }
+
+    let selectedBoxes: [CGRect]
+    if foregroundCandidates.count >= 2 {
+        selectedBoxes = Array(foregroundCandidates.prefix(2))
+    } else if foregroundCandidates.count == 1 {
+        let primaryBox = foregroundCandidates[0]
+        let fallbackSecondBox = sortedByProximity.first { candidate in
+            candidate != primaryBox &&
+                isFallbackForegroundPlayerBox(
+                    candidate,
+                    nearestFootline: nearestFootline,
+                    largestHeight: largestHeight,
+                    largestArea: largestArea
+                )
+        }
+        selectedBoxes = [primaryBox] + Array([fallbackSecondBox].compactMap { $0 }.prefix(1))
+    } else {
+        selectedBoxes = Array(sortedByProximity.prefix(2))
+    }
+
+    return selectedBoxes.sorted { $0.midX < $1.midX }
 }
 
 private struct StableAssignmentCandidate {
@@ -960,17 +1006,25 @@ struct RallyInterval: Identifiable, Codable, Hashable {
 private struct TrackingSidecarFile: Codable {
     let frames: [TrackingSidecarFrame]
     let rallyIntervals: [RallyInterval]
+    let feedbackEvents: [TrackingSidecarFeedbackEvent]
     let handednessMode: PlayerHandednessMode
 
-    init(frames: [TrackingSidecarFrame], rallyIntervals: [RallyInterval], handednessMode: PlayerHandednessMode) {
+    init(
+        frames: [TrackingSidecarFrame],
+        rallyIntervals: [RallyInterval],
+        feedbackEvents: [TrackingSidecarFeedbackEvent],
+        handednessMode: PlayerHandednessMode
+    ) {
         self.frames = frames
         self.rallyIntervals = rallyIntervals
+        self.feedbackEvents = feedbackEvents
         self.handednessMode = handednessMode
     }
 
     private enum CodingKeys: String, CodingKey {
         case frames
         case rallyIntervals
+        case feedbackEvents
         case handednessMode
     }
 
@@ -978,8 +1032,16 @@ private struct TrackingSidecarFile: Codable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         frames = try container.decode([TrackingSidecarFrame].self, forKey: .frames)
         rallyIntervals = try container.decodeIfPresent([RallyInterval].self, forKey: .rallyIntervals) ?? []
+        feedbackEvents = try container.decodeIfPresent([TrackingSidecarFeedbackEvent].self, forKey: .feedbackEvents) ?? []
         handednessMode = try container.decodeIfPresent(PlayerHandednessMode.self, forKey: .handednessMode) ?? .rightRight
     }
+}
+
+private struct TrackingSidecarFeedbackEvent: Codable, Hashable {
+    let kind: String
+    let playerLabel: String
+    let startTime: Double
+    let endTime: Double
 }
 
 private struct TrackingSidecarFrame: Codable {
@@ -1296,6 +1358,7 @@ private extension TrackedPlayerBox {
 struct MovementEvent: Identifiable, Hashable {
     enum Kind: String, Hashable, CaseIterable {
         case wrongExitDirection
+        case directRetreatToWaiting
         case missingWaitingRecovery
         case failedToClearHittingZone
     }
@@ -1326,14 +1389,14 @@ struct ReviewSuggestion: Identifiable, Hashable {
 
 enum VideoReviewAnalyzer {
     private enum ReviewConstants {
-        static let minimumEventDuration: Double = 0.35
+        static let minimumEventDuration: Double = 0.2
         static let samplingStride = 2
-        static let hittingZoneMaxY: CGFloat = 0.3
+        static let hittingZoneMaxY: CGFloat = 1.5
         static let exitZoneMaxY: CGFloat = 0.56
-        static let waitingZoneMinY: CGFloat = 0.34
-        static let hittingZoneOverstayDuration: Double = 0.85
+        static let waitingZoneMinY: CGFloat = 1.5
+        static let hittingZoneOverstayDuration: Double = 0.5
         static let wrongExitDecisionDelay: Double = 0.3
-        static let exitZoneOverstayDuration: Double = 1.2
+        static let exitZoneOverstayDuration: Double = 0.35
     }
 
     private enum HittingSide {
@@ -1362,6 +1425,7 @@ enum VideoReviewAnalyzer {
     private enum CourtRoleZone {
         case hitting
         case exit
+        case wrongExit
         case waiting
         case other
     }
@@ -1371,6 +1435,8 @@ enum VideoReviewAnalyzer {
         let hittingZoneEnteredAt: Double
         var leftHittingZoneAt: Double?
         var enteredExitZoneAt: Double?
+        var skippedExitZoneAt: Double?
+        var partnerBecameHitterAt: Double?
     }
 
     private struct EventKey: Hashable {
@@ -1386,9 +1452,16 @@ enum VideoReviewAnalyzer {
         var confidenceSamples: [Double]
     }
 
+    private struct ReviewEventDedupKey: Hashable {
+        let rallyIndex: Int
+        let kind: MovementEvent.Kind
+        let playerLabel: String?
+    }
+
     private struct SidecarReviewContext {
         let frames: [PlayerTrackFrame]
         let rallyIntervals: [RallyInterval]
+        let feedbackEvents: [TrackingSidecarFeedbackEvent]
         let handednessMode: PlayerHandednessMode
     }
 
@@ -1405,11 +1478,21 @@ enum VideoReviewAnalyzer {
         let duration = normalizedDuration(from: asset.duration)
 
         if let sidecar = loadReviewContextFromSidecar(for: video) {
-            let movementEvents = buildMovementEvents(
-                from: sidecar.frames,
+            let shouldRebuildFeedbackEvents = shouldRebuildFeedbackEventsFromFrames(
+                sidecar.feedbackEvents,
                 rallyIntervals: sidecar.rallyIntervals,
-                handednessMode: sidecar.handednessMode
+                frames: sidecar.frames
             )
+            let movementEvents = sidecar.feedbackEvents.isEmpty || shouldRebuildFeedbackEvents
+                ? buildMovementEvents(
+                    from: sidecar.frames,
+                    rallyIntervals: sidecar.rallyIntervals,
+                    handednessMode: sidecar.handednessMode
+                )
+                : buildMovementEvents(
+                    fromSidecarFeedbackEvents: sidecar.feedbackEvents,
+                    rallyIntervals: sidecar.rallyIntervals
+                )
             let suggestions = buildSuggestions(from: movementEvents)
             return ReviewSession(
                 video: video,
@@ -1484,6 +1567,21 @@ enum VideoReviewAnalyzer {
         )
     }
 
+    private static func shouldRebuildFeedbackEventsFromFrames(
+        _ feedbackEvents: [TrackingSidecarFeedbackEvent],
+        rallyIntervals: [RallyInterval],
+        frames: [PlayerTrackFrame]
+    ) -> Bool {
+        guard !feedbackEvents.isEmpty, !rallyIntervals.isEmpty, !frames.isEmpty else { return false }
+
+        return feedbackEvents.allSatisfy { feedbackEvent in
+            rallyIntervals.contains { interval in
+                abs(feedbackEvent.startTime - interval.startTime) < 0.05
+                    && abs(feedbackEvent.endTime - interval.endTime) < 0.05
+            }
+        }
+    }
+
     private static func loadReviewContextFromSidecar(for video: SavedVideo) -> SidecarReviewContext? {
         let sidecarURL = video.trackingDataURL
         guard FileManager.default.fileExists(atPath: sidecarURL.path) else { return nil }
@@ -1494,6 +1592,7 @@ enum VideoReviewAnalyzer {
             return SidecarReviewContext(
                 frames: normalizedTrackFrameTimes(sidecar.frames.map { $0.playerTrackFrame() }),
                 rallyIntervals: sidecar.rallyIntervals,
+                feedbackEvents: sidecar.feedbackEvents,
                 handednessMode: sidecar.handednessMode
             )
         } catch {
@@ -1540,11 +1639,13 @@ enum VideoReviewAnalyzer {
         rallyIntervals: [RallyInterval],
         handednessMode: PlayerHandednessMode
     ) -> [MovementEvent] {
-        let rallyFrames = frames.filter { frame in
+        guard handednessMode == .rightRight else { return [] }
+
+        let intervalFrames = frames.filter { frame in
             rallyIntervals.isEmpty || rallyIntervals.contains(where: { frame.time >= $0.startTime && frame.time <= $0.endTime })
         }
-        let smoothedFrames = filteredCourtMapFrames(from: rallyFrames)
-        guard !smoothedFrames.isEmpty else { return [] }
+        let analysisFrames = intervalFrames.isEmpty && !rallyIntervals.isEmpty ? frames : intervalFrames
+        guard !analysisFrames.isEmpty else { return [] }
 
         var events: [MovementEvent] = []
         var activeIntervals: [EventKey: ActiveReviewEventInterval] = [:]
@@ -1614,7 +1715,7 @@ enum VideoReviewAnalyzer {
             }
         }
 
-        for frame in smoothedFrames {
+        for frame in analysisFrames {
             let playerLookup = Dictionary(uniqueKeysWithValues: frame.players.map { ($0.id, $0) })
             let hitterID = reviewHitterID(in: frame)
 
@@ -1639,7 +1740,9 @@ enum VideoReviewAnalyzer {
                             side: playerSide,
                             hittingZoneEnteredAt: frame.time,
                             leftHittingZoneAt: nil,
-                            enteredExitZoneAt: nil
+                            enteredExitZoneAt: nil,
+                            skippedExitZoneAt: nil,
+                            partnerBecameHitterAt: nil
                         )
                     }
                 }
@@ -1653,6 +1756,10 @@ enum VideoReviewAnalyzer {
                 var wrongExitCandidate: EventCandidate?
                 var waitingCandidate: EventCandidate?
                 var noClearCandidate: EventCandidate?
+
+                if hitterID != playerLabel, phase.enteredExitZoneAt != nil, phase.partnerBecameHitterAt == nil {
+                    phase.partnerBecameHitterAt = frame.time
+                }
 
                 if zone == .hitting {
                     let dwellDuration = frame.time - phase.hittingZoneEnteredAt
@@ -1679,104 +1786,76 @@ enum VideoReviewAnalyzer {
 
                     switch zone {
                     case .waiting:
-                        if handednessMode == .rightRight, phase.enteredExitZoneAt == nil, let leftTime = phase.leftHittingZoneAt {
-                            let wrongDuration = frame.time - leftTime
-                            if wrongDuration >= ReviewConstants.wrongExitDecisionDelay {
-                                appendEvent(
-                                    key: EventKey(kind: .wrongExitDirection, playerLabel: playerLabel),
+                        if phase.enteredExitZoneAt == nil, let leftTime = phase.leftHittingZoneAt {
+                            let directRetreatDuration = frame.time - leftTime
+                            let eventEndTime = max(frame.time, leftTime + ReviewConstants.minimumEventDuration)
+                            appendEvent(
+                                key: EventKey(kind: .directRetreatToWaiting, playerLabel: playerLabel),
+                                startTime: leftTime,
+                                endTime: eventEndTime,
+                                candidate: directRetreatToWaitingCandidate(
+                                    for: playerLabel,
+                                    side: phase.side,
                                     startTime: leftTime,
-                                    endTime: frame.time,
-                                    candidate: wrongExitDirectionCandidate(for: playerLabel, side: phase.side, startTime: leftTime, endTime: frame.time),
-                                    confidenceSamples: [0.9]
-                                )
-                            }
+                                    endTime: eventEndTime,
+                                    confidence: min(max(directRetreatDuration / 0.7, 0.75), 1)
+                                ),
+                                confidenceSamples: [0.9]
+                            )
                         }
                         deactivateAllEvents(for: playerLabel, at: frame.time)
                         reviewPhases.removeValue(forKey: playerLabel)
                         continue
                     case .exit:
-                        guard handednessMode == .rightRight else { break }
                         if phase.enteredExitZoneAt == nil {
                             phase.enteredExitZoneAt = frame.time
                         }
-                        let exitDuration = frame.time - (phase.enteredExitZoneAt ?? frame.time)
-                        if exitDuration >= ReviewConstants.exitZoneOverstayDuration {
+                        if let partnerBecameHitterAt = phase.partnerBecameHitterAt,
+                           frame.time - partnerBecameHitterAt >= ReviewConstants.exitZoneOverstayDuration {
+                            let exitDuration = frame.time - partnerBecameHitterAt
                             waitingCandidate = waitingRecoveryCandidate(
                                 for: playerLabel,
-                                startTime: phase.enteredExitZoneAt ?? frame.time,
+                                startTime: partnerBecameHitterAt,
                                 endTime: frame.time,
                                 confidence: min(
                                     max(
-                                        (exitDuration - ReviewConstants.exitZoneOverstayDuration) / 1.2,
-                                        0.45
+                                        (exitDuration - ReviewConstants.exitZoneOverstayDuration) / 0.8,
+                                        0.65
                                     ),
                                     1
                                 ),
                                 handednessMode: handednessMode
                             )
                         }
-                    case .other:
+                    case .wrongExit:
                         if let leftTime = phase.leftHittingZoneAt {
-                            let recoveryDuration = frame.time - leftTime
-                            if handednessMode == .rightRight {
-                                if recoveryDuration >= ReviewConstants.wrongExitDecisionDelay {
-                                    let confidence = min(
-                                        max(
-                                            (recoveryDuration - ReviewConstants.wrongExitDecisionDelay) / 0.8,
-                                            0.45
-                                        ),
-                                        1
-                                    )
-                                    wrongExitCandidate = wrongExitDirectionCandidate(
-                                        for: playerLabel,
-                                        side: phase.side,
-                                        startTime: leftTime,
-                                        endTime: frame.time,
-                                        confidence: confidence
-                                    )
-                                }
-                            } else if recoveryDuration >= ReviewConstants.wrongExitDecisionDelay {
-                                waitingCandidate = waitingRecoveryCandidate(
+                            let wrongDuration = frame.time - leftTime
+                            if wrongDuration >= ReviewConstants.wrongExitDecisionDelay {
+                                wrongExitCandidate = wrongExitDirectionCandidate(
                                     for: playerLabel,
+                                    side: phase.side,
                                     startTime: leftTime,
                                     endTime: frame.time,
-                                    confidence: min(
-                                        max(
-                                            (recoveryDuration - ReviewConstants.wrongExitDecisionDelay) / 0.8,
-                                            0.45
-                                        ),
-                                        1
-                                    ),
-                                    handednessMode: handednessMode
+                                    confidence: min(max((wrongDuration - ReviewConstants.wrongExitDecisionDelay) / 0.7, 0.65), 1)
                                 )
                             }
                         }
+                    case .other:
+                        break
                     case .hitting:
                         break
                     }
                 }
 
                 reviewPhases[playerLabel] = phase
-                if handednessMode == .rightRight {
-                    if let wrongExitCandidate {
-                        setEventActive(wrongExitCandidate, playerLabel: playerLabel, isActive: true, time: frame.time)
-                    } else {
-                        setEventActive(
-                            wrongExitDirectionCandidate(
-                                for: playerLabel,
-                                side: phase.side,
-                                startTime: phase.leftHittingZoneAt ?? frame.time,
-                                endTime: frame.time,
-                                confidence: 0.45
-                            ),
-                            playerLabel: playerLabel,
-                            isActive: false,
-                            time: frame.time
-                        )
-                    }
+
+                if let wrongExitCandidate {
+                    setEventActive(wrongExitCandidate, playerLabel: playerLabel, isActive: true, time: frame.time)
                 } else {
                     deactivateEvent(EventKey(kind: .wrongExitDirection, playerLabel: playerLabel), at: frame.time)
                 }
+
+                deactivateEvent(EventKey(kind: .directRetreatToWaiting, playerLabel: playerLabel), at: frame.time)
 
                 if let waitingCandidate {
                     setEventActive(waitingCandidate, playerLabel: playerLabel, isActive: true, time: frame.time)
@@ -1824,12 +1903,70 @@ enum VideoReviewAnalyzer {
             )
         }
 
-        return events.sorted { lhs, rhs in
+        let sortedEvents = events.sorted { lhs, rhs in
             if lhs.startTime == rhs.startTime {
                 return lhs.confidence > rhs.confidence
             }
             return lhs.startTime < rhs.startTime
         }
+
+        return deduplicatedMovementEvents(sortedEvents, rallyIntervals: rallyIntervals)
+    }
+
+    private static func buildMovementEvents(
+        fromSidecarFeedbackEvents feedbackEvents: [TrackingSidecarFeedbackEvent],
+        rallyIntervals: [RallyInterval]
+    ) -> [MovementEvent] {
+        let sortedEvents: [MovementEvent] = feedbackEvents.compactMap { feedbackEvent -> MovementEvent? in
+            guard let kind = MovementEvent.Kind(rawValue: feedbackEvent.kind) else { return nil }
+            let startTime = min(feedbackEvent.startTime, feedbackEvent.endTime)
+            let endTime = max(feedbackEvent.startTime, feedbackEvent.endTime)
+            return MovementEvent(
+                kind: kind,
+                startTime: startTime,
+                endTime: max(endTime, startTime + ReviewConstants.minimumEventDuration),
+                playerLabel: feedbackEvent.playerLabel,
+                confidence: 0.95,
+                title: sidecarFeedbackTitle(for: kind, playerLabel: feedbackEvent.playerLabel),
+                detail: sidecarFeedbackDetail(for: kind, playerLabel: feedbackEvent.playerLabel, startTime: startTime, endTime: endTime)
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.startTime == rhs.startTime {
+                return lhs.confidence > rhs.confidence
+            }
+            return lhs.startTime < rhs.startTime
+        }
+
+        return deduplicatedMovementEvents(sortedEvents, rallyIntervals: rallyIntervals)
+    }
+
+    private static func deduplicatedMovementEvents(_ events: [MovementEvent], rallyIntervals: [RallyInterval]) -> [MovementEvent] {
+        guard !rallyIntervals.isEmpty else { return events }
+
+        var seenKeys = Set<ReviewEventDedupKey>()
+        var deduplicatedEvents: [MovementEvent] = []
+
+        for event in events {
+            guard let rallyIndex = rallyIntervals.firstIndex(where: { interval in
+                event.startTime >= interval.startTime && event.startTime <= interval.endTime
+            }) else {
+                deduplicatedEvents.append(event)
+                continue
+            }
+
+            let key = ReviewEventDedupKey(
+                rallyIndex: rallyIndex,
+                kind: event.kind,
+                playerLabel: event.playerLabel
+            )
+            guard !seenKeys.contains(key) else { continue }
+
+            seenKeys.insert(key)
+            deduplicatedEvents.append(event)
+        }
+
+        return deduplicatedEvents
     }
 
     private static func normalizedDuration(from time: CMTime) -> Double {
@@ -1854,6 +1991,8 @@ enum VideoReviewAnalyzer {
         switch event.kind {
         case .wrongExitDirection:
             return exitDirectionSuggestionTitle(for: event)
+        case .directRetreatToWaiting:
+            return "\(event.playerLabel ?? "球員") 不要直接後退"
         case .missingWaitingRecovery:
             return "\(event.playerLabel ?? "球員") 先回等待補位區"
         case .failedToClearHittingZone:
@@ -1861,17 +2000,51 @@ enum VideoReviewAnalyzer {
         }
     }
 
+    private static func sidecarFeedbackTitle(for kind: MovementEvent.Kind, playerLabel: String) -> String {
+        switch kind {
+        case .wrongExitDirection:
+            return "\(playerLabel) 退錯邊"
+        case .directRetreatToWaiting:
+            return "\(playerLabel) 擊球後直接後退"
+        case .missingWaitingRecovery:
+            return "\(playerLabel) 沒有等待補位"
+        case .failedToClearHittingZone:
+            return "\(playerLabel) 擊球完沒有讓開"
+        }
+    }
+
+    private static func sidecarFeedbackDetail(
+        for kind: MovementEvent.Kind,
+        playerLabel: String,
+        startTime: Double,
+        endTime: Double
+    ) -> String {
+        switch kind {
+        case .wrongExitDirection:
+            return "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間，錄影時已判定擊球後退到錯誤側。原因是錯邊退出會佔到隊友準備進入擊球區的路線，讓下一板銜接變慢。"
+        case .directRetreatToWaiting:
+            return "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間，錄影時已判定擊球後沒有先經過外側退出區，而是直接退到等待區。原因是直接後退會穿過隊友補位路線，容易造成兩人互相卡位。"
+        case .missingWaitingRecovery:
+            return "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間，錄影時已判定隊友成為擊球員後仍停在退出區太久。退出區應該只是短暫過渡位置，停太久會降低下一次輪轉速度。"
+        case .failedToClearHittingZone:
+            return "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間，錄影時已判定擊球後停在擊球區太久。擊球區是下一位隊友要進入的位置，停留過久會擋住隊友上前擊球。"
+        }
+    }
+
     private static func suggestionText(for event: MovementEvent) -> String {
         switch event.kind {
         case .wrongExitDirection:
             let player = event.playerLabel ?? "該球員"
-            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間，離開擊球區後先往正確的退出方向移動，再往後回到等待補位區。"
+            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間，擊球後先往該半區外側退出。原因是錯邊退出會佔到隊友準備進入擊球區的路線，讓下一板銜接變慢。"
+        case .directRetreatToWaiting:
+            let player = event.playerLabel ?? "該球員"
+            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間，不要擊球後直接往後退到等待區。原因是直接後退會穿過隊友的補位路線，雙打輪轉時容易和隊友互相卡位；應先往擊球側外側退出，再回到後方等待區。"
         case .missingWaitingRecovery:
             let player = event.playerLabel ?? "該球員"
-            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間完成擊球後盡快回到等待補位區，不要持續停在前場或過渡位置。"
+            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間，隊友已經成為擊球員後要更快離開退出區並回到等待區。原因是退出區只是一個短暫過渡位置，停太久會讓場上形成側邊壅塞，也會降低下一次補位速度。"
         case .failedToClearHittingZone:
             let player = event.playerLabel ?? "該球員"
-            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間擊球後更快離開前場擊球區，讓出下一板的進入路線。"
+            return "AI 建議 \(player) 在 \(timeLabel(event.startTime)) 到 \(timeLabel(event.endTime)) 之間擊球後更快離開前場擊球區。原因是擊球區是下一位隊友要進入的位置，停留過久會擋住隊友上前擊球，也會讓輪轉節奏變慢。"
         }
     }
 
@@ -1904,11 +2077,14 @@ enum VideoReviewAnalyzer {
             if hittingZoneRect(for: side).contains(point) {
                 return .hitting
             }
-            if waitingZoneRect(for: side).contains(point) {
-                return .waiting
-            }
             if exitZoneRect(for: side).contains(point) {
                 return .exit
+            }
+            if exitZoneRect(for: oppositeSide(of: side)).contains(point) {
+                return .wrongExit
+            }
+            if waitingZoneRect(for: side).contains(point) {
+                return .waiting
             }
             return .other
         case .leftRight:
@@ -1934,18 +2110,27 @@ enum VideoReviewAnalyzer {
     private static func exitZoneRect(for side: HittingSide) -> CGRect {
         switch side {
         case .left:
-            return CGRect(x: -1.6, y: 0.0, width: 0.6, height: ReviewConstants.exitZoneMaxY)
+            return CGRect(x: -8.0, y: 0.0, width: 7.0, height: 8.0)
         case .right:
-            return CGRect(x: 1.0, y: 0.0, width: 0.6, height: ReviewConstants.exitZoneMaxY)
+            return CGRect(x: 1.0, y: 0.0, width: 7.0, height: 8.0)
+        }
+    }
+
+    private static func oppositeSide(of side: HittingSide) -> HittingSide {
+        switch side {
+        case .left:
+            return .right
+        case .right:
+            return .left
         }
     }
 
     private static func waitingZoneRect(for side: HittingSide) -> CGRect {
         switch side {
         case .left:
-            return CGRect(x: -1.2, y: ReviewConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+            return CGRect(x: -1.2, y: ReviewConstants.waitingZoneMinY, width: 1.3, height: 80.0)
         case .right:
-            return CGRect(x: -0.1, y: ReviewConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+            return CGRect(x: -0.1, y: ReviewConstants.waitingZoneMinY, width: 1.3, height: 80.0)
         }
     }
 
@@ -1970,7 +2155,7 @@ enum VideoReviewAnalyzer {
         let detail: String
         switch handednessMode {
         case .rightRight:
-            detail = "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間持續停在擊球後退出區，沒有回到後方等待補位區。"
+            detail = "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間，隊友已經接手成為擊球員後仍停在擊球後退出區，沒有快速回到後方等待補位區。退出區應該只是短暫過渡位置，停太久會讓側邊路線被佔住，也會降低下一次輪轉速度。"
         case .leftRight:
             detail = "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間離開擊球區後，沒有盡快移到後方或兩側的等待區。"
         }
@@ -1981,6 +2166,22 @@ enum VideoReviewAnalyzer {
             confidence: confidence,
             title: "\(playerLabel) 沒有等待補位",
             detail: detail
+        )
+    }
+
+    private static func directRetreatToWaitingCandidate(
+        for playerLabel: String,
+        side: HittingSide,
+        startTime: Double,
+        endTime: Double,
+        confidence: Double
+    ) -> EventCandidate {
+        EventCandidate(
+            kind: .directRetreatToWaiting,
+            playerLabel: playerLabel,
+            confidence: confidence,
+            title: "\(playerLabel) 擊球後直接後退",
+            detail: "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間，從\(side.exitDirectionLabel)半邊擊球後沒有先經過外側退出區，而是直接退到等待區。這會穿過隊友補位路線，容易造成兩人互相卡位。"
         )
     }
 
@@ -1996,7 +2197,7 @@ enum VideoReviewAnalyzer {
             playerLabel: playerLabel,
             confidence: confidence,
             title: "\(playerLabel) 退錯邊",
-            detail: "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間離開擊球區後，沒有先往\(side.exitDirectionLabel)的擊球後退出區移動。"
+            detail: "\(playerLabel) 在 \(timeLabel(startTime)) 到 \(timeLabel(endTime)) 之間離開擊球區後，沒有先往\(side.exitDirectionLabel)的外側退出區移動。擊球後應該退出到自己擊球半邊的外側，讓隊友有空間從中間或後方進入擊球區。"
         )
     }
 
@@ -3823,6 +4024,8 @@ extension MovementEvent {
         switch kind {
         case .wrongExitDirection:
             return .red
+        case .directRetreatToWaiting:
+            return .purple
         case .missingWaitingRecovery:
             return .blue
         case .failedToClearHittingZone:
@@ -3834,6 +4037,8 @@ extension MovementEvent {
         switch kind {
         case .wrongExitDirection:
             return "退錯邊"
+        case .directRetreatToWaiting:
+            return "擊球後直接後退"
         case .missingWaitingRecovery:
             return "沒有等待補位"
         case .failedToClearHittingZone:
@@ -3847,6 +4052,8 @@ extension ReviewSuggestion {
         switch eventKind {
         case .wrongExitDirection:
             return .red
+        case .directRetreatToWaiting:
+            return .purple
         case .missingWaitingRecovery:
             return .blue
         case .failedToClearHittingZone:
@@ -3858,6 +4065,8 @@ extension ReviewSuggestion {
         switch eventKind {
         case .wrongExitDirection:
             return "退錯邊"
+        case .directRetreatToWaiting:
+            return "擊球後直接後退"
         case .missingWaitingRecovery:
             return "沒有等待補位"
         case .failedToClearHittingZone:
@@ -3929,10 +4138,10 @@ final class CameraManager: NSObject, ObservableObject {
 
     private enum RallyFeedbackConstants {
         static let directionalCueDelay: Double = 0.5
-        static let hittingZoneMaxY: CGFloat = 0.3
+        static let hittingZoneMaxY: CGFloat = 1.5
         static let exitZoneMaxY: CGFloat = 0.56
         static let hittingZoneOverstayDuration: Double = 0.5
-        static let waitingZoneMinY: CGFloat = 0.34
+        static let waitingZoneMinY: CGFloat = 1.5
         static let exitToWaitingTransitionDuration: Double = 0.35
     }
 
@@ -3999,6 +4208,16 @@ final class CameraManager: NSObject, ObservableObject {
 
         let playerID: String
         let kind: Kind
+        let triggeredAt: Double
+
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(playerID)
+            hasher.combine(kind)
+        }
+
+        static func == (lhs: AfterRallyFeedbackEvent, rhs: AfterRallyFeedbackEvent) -> Bool {
+            lhs.playerID == rhs.playerID && lhs.kind == rhs.kind
+        }
     }
 
     private struct PendingDirectionalCue {
@@ -4046,6 +4265,7 @@ final class CameraManager: NSObject, ObservableObject {
     private var audioFeedbackMuteUntil: CFTimeInterval = 0
     private var recordedTrackFrames: [PlayerTrackFrame] = []
     private var recordedRallyIntervals: [RallyInterval] = []
+    private var recordedFeedbackEvents: [TrackingSidecarFeedbackEvent] = []
     private var currentRecordedRallyStartTime: Double?
     private var lastRecordedFrameTime: Double = 0
     private var recordingHandednessMode: PlayerHandednessMode = .rightRight
@@ -4200,6 +4420,7 @@ final class CameraManager: NSObject, ObservableObject {
         isFinishingRecording = false
         recordedTrackFrames = []
         recordedRallyIntervals = []
+        recordedFeedbackEvents = []
         currentRecordedRallyStartTime = nil
         lastRecordedFrameTime = 0
         isRecording = true
@@ -4229,6 +4450,7 @@ final class CameraManager: NSObject, ObservableObject {
         recordingSourceCanvasSize = .zero
         recordedTrackFrames = []
         recordedRallyIntervals = []
+        recordedFeedbackEvents = []
         currentRecordedRallyStartTime = nil
         lastRecordedFrameTime = 0
         resetRallyAnalysisState()
@@ -4349,6 +4571,9 @@ final class CameraManager: NSObject, ObservableObject {
                 let feedback = liveFeedbackMode == .afterRally && playFeedback && previousState == .start
                     ? afterRallyFeedbackMessagesLocked()
                     : []
+                if liveFeedbackMode == .afterRally && playFeedback && previousState == .start {
+                    recordAfterRallyFeedbackEventsLocked()
+                }
                 resetRallyAnalysisStateLocked()
                 if !feedback.isEmpty {
                     audioFeedbackMuteUntil = CACurrentMediaTime() + RallyFeedbackSpeaker.estimatedDuration(for: feedback)
@@ -4390,6 +4615,39 @@ final class CameraManager: NSObject, ObservableObject {
             }
         default:
             break
+        }
+    }
+
+    private func recordAfterRallyFeedbackEventsLocked() {
+        guard recordingHandednessMode == .rightRight else { return }
+        guard let rallyInterval = recordedRallyIntervals.last else { return }
+
+        for event in afterRallyFeedbackEvents {
+            let eventTime = min(
+                max(normalizeRecordingTimestamp(event.triggeredAt), rallyInterval.startTime),
+                rallyInterval.endTime
+            )
+            recordedFeedbackEvents.append(
+                TrackingSidecarFeedbackEvent(
+                    kind: movementEventKind(for: event.kind).rawValue,
+                    playerLabel: event.playerID,
+                    startTime: eventTime,
+                    endTime: min(rallyInterval.endTime, eventTime + 0.3)
+                )
+            )
+        }
+    }
+
+    private func movementEventKind(for kind: AfterRallyFeedbackEvent.Kind) -> MovementEvent.Kind {
+        switch kind {
+        case .hittingZoneOverstay:
+            return .failedToClearHittingZone
+        case .wrongExitSide:
+            return .wrongExitDirection
+        case .directRetreatToWaiting:
+            return .directRetreatToWaiting
+        case .exitZoneOverstay:
+            return .missingWaitingRecovery
         }
     }
 
@@ -4563,7 +4821,7 @@ final class CameraManager: NSObject, ObservableObject {
             case .hitting:
                 if (timestamp - phase.hittingZoneEnteredAt) >= RallyFeedbackConstants.hittingZoneOverstayDuration {
                     afterRallyFeedbackEvents.insert(
-                        AfterRallyFeedbackEvent(playerID: playerID, kind: .hittingZoneOverstay)
+                        AfterRallyFeedbackEvent(playerID: playerID, kind: .hittingZoneOverstay, triggeredAt: timestamp)
                     )
                 }
             case .correctExit:
@@ -4576,7 +4834,7 @@ final class CameraManager: NSObject, ObservableObject {
                 if let partnerBecameHitterAt = phase.partnerBecameHitterAt,
                    (timestamp - partnerBecameHitterAt) >= RallyFeedbackConstants.exitToWaitingTransitionDuration {
                     afterRallyFeedbackEvents.insert(
-                        AfterRallyFeedbackEvent(playerID: playerID, kind: .exitZoneOverstay)
+                        AfterRallyFeedbackEvent(playerID: playerID, kind: .exitZoneOverstay, triggeredAt: timestamp)
                     )
                 }
             case .wrongExit:
@@ -4584,7 +4842,7 @@ final class CameraManager: NSObject, ObservableObject {
                     phase.leftHittingZoneAt = timestamp
                 }
                 afterRallyFeedbackEvents.insert(
-                    AfterRallyFeedbackEvent(playerID: playerID, kind: .wrongExitSide)
+                    AfterRallyFeedbackEvent(playerID: playerID, kind: .wrongExitSide, triggeredAt: timestamp)
                 )
             case .waiting:
                 if phase.leftHittingZoneAt == nil {
@@ -4593,7 +4851,7 @@ final class CameraManager: NSObject, ObservableObject {
                 if phase.enteredExitZoneAt == nil, phase.skippedExitZoneAt == nil {
                     phase.skippedExitZoneAt = timestamp
                     afterRallyFeedbackEvents.insert(
-                        AfterRallyFeedbackEvent(playerID: playerID, kind: .directRetreatToWaiting)
+                        AfterRallyFeedbackEvent(playerID: playerID, kind: .directRetreatToWaiting, triggeredAt: timestamp)
                     )
                 }
             case .other:
@@ -4766,9 +5024,9 @@ final class CameraManager: NSObject, ObservableObject {
     private func liveWaitingZoneRect(for side: LiveHittingSide) -> CGRect {
         switch side {
         case .left:
-            return CGRect(x: -1.2, y: RallyFeedbackConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+            return CGRect(x: -1.2, y: RallyFeedbackConstants.waitingZoneMinY, width: 1.3, height: 80.0)
         case .right:
-            return CGRect(x: -0.1, y: RallyFeedbackConstants.waitingZoneMinY, width: 1.3, height: 1.8)
+            return CGRect(x: -0.1, y: RallyFeedbackConstants.waitingZoneMinY, width: 1.3, height: 80.0)
         }
     }
 
@@ -5193,7 +5451,11 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
                 height: previousPlayer.boundingBox.height + ((player.boundingBox.height - previousPlayer.boundingBox.height) * factor)
             )
 
-            return TrackedPlayerBox(id: player.id, label: player.label, boundingBox: smoothedBox)
+            return TrackedPlayerBox(
+                id: player.id,
+                label: player.label,
+                boundingBox: smoothedBox
+            )
         }
     }
 
@@ -5339,17 +5601,15 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         players: [TrackedPlayerBox]
     ) {
         let summaries = players.map { player in
-            let playerAreaSummary: String
-            if let point = player.playerAreaPoint {
-                let lateral = player.lateralPosition ?? "n/a"
-                let depth = player.depthPosition ?? "n/a"
-                playerAreaSummary = " area:\(formatDebugValue(point.x)),\(formatDebugValue(point.y)) \(lateral)/\(depth)"
-            } else {
-                playerAreaSummary = ""
-            }
-
+            let boxSummary = "box:\(formatDebugValue(player.boundingBox.midX)),\(formatDebugValue(player.boundingBox.midY))"
+            let footSummary = player.footPoint.map {
+                " foot:\(formatDebugValue($0.x)),\(formatDebugValue($0.y))"
+            } ?? " foot:nil"
+            let areaSummary = player.playerAreaPoint.map {
+                " area:\(formatDebugValue($0.x)),\(formatDebugValue($0.y))"
+            } ?? " area:nil"
             let hitterSummary = player.isCurrentHitter ? " hitter" : ""
-            return "\(player.label) x:\(formatDebugValue(player.boundingBox.midX)) y:\(formatDebugValue(player.boundingBox.midY))\(playerAreaSummary)\(hitterSummary)"
+            return "\(player.label) \(boxSummary)\(footSummary)\(areaSummary)\(hitterSummary)"
         }
 
         DispatchQueue.main.async {
@@ -5444,6 +5704,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         let sidecar = TrackingSidecarFile(
             frames: recordedTrackFrames.map(TrackingSidecarFrame.init),
             rallyIntervals: recordedRallyIntervals,
+            feedbackEvents: recordedFeedbackEvents,
             handednessMode: recordingHandednessMode
         )
 
