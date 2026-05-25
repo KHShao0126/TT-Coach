@@ -2992,6 +2992,7 @@ struct VideoReviewScreen: View {
                         reviewSummary(session: session)
                         reviewSuggestionList(session: session)
                         reviewEventList(session: session)
+                        coordinationScoreCard(session: session)
                     } else {
                         Text(localized(appLanguage, zh: "正在建立 review 資料模型與事件點。", en: "Building the review model and event markers."))
                             .font(.subheadline)
@@ -3225,6 +3226,205 @@ struct VideoReviewScreen: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private func coordinationScoreCard(session: ReviewSession) -> some View {
+        let summary = coordinationScoreSummary(for: session)
+
+        return VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(localized(appLanguage, zh: "配合度分數", en: "Coordination Score"))
+                    .font(.headline)
+                Spacer()
+                Text("\(summary.score) / 100")
+                    .font(.title3.weight(.bold).monospacedDigit())
+                    .foregroundStyle(coordinationScoreColor(summary.score))
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(localized(appLanguage, zh: "主要問題", en: "Main Issue"))
+                    .font(.subheadline.weight(.semibold))
+                Text(summary.mainIssueText)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(localized(appLanguage, zh: "錯誤細項", en: "Breakdown"))
+                    .font(.subheadline.weight(.semibold))
+
+                ForEach(MovementEvent.Kind.allCases, id: \.self) { kind in
+                    HStack {
+                        Text(coordinationBreakdownLabel(for: kind))
+                        Spacer()
+                        Text("\(summary.counts[kind, default: 0])")
+                            .font(.footnote.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.footnote)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(localized(appLanguage, zh: "建議", en: "Suggestion"))
+                    .font(.subheadline.weight(.semibold))
+                Text(summary.suggestion)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.leading)
+            }
+
+            Text(localized(
+                appLanguage,
+                zh: "計算方式：總扣分 \(scoreNumberString(summary.totalPenalty))，平均每段 rally 扣分 \(scoreNumberString(summary.averagePenaltyPerRally))，rally 數 \(summary.rallyCount)。",
+                en: "Formula: total penalty \(scoreNumberString(summary.totalPenalty)), average penalty per rally \(scoreNumberString(summary.averagePenaltyPerRally)), rally count \(summary.rallyCount)."
+            ))
+            .font(.caption)
+            .foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(18)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+    }
+
+    private struct CoordinationScoreSummary {
+        let score: Int
+        let rallyCount: Int
+        let totalPenalty: Double
+        let averagePenaltyPerRally: Double
+        let counts: [MovementEvent.Kind: Int]
+        let mainIssueText: String
+        let suggestion: String
+    }
+
+    private func coordinationScoreSummary(for session: ReviewSession) -> CoordinationScoreSummary {
+        let rallyCount = max(session.rallyIntervals.count, 1)
+        var counts: [MovementEvent.Kind: Int] = [:]
+        var weightedCounts: [MovementEvent.Kind: Double] = [:]
+        var totalPenalty = 0.0
+
+        for event in session.movementEvents {
+            let severity = min(max(event.confidence, 0), 1)
+            let weight = coordinationFeedbackWeight(for: event.kind)
+            counts[event.kind, default: 0] += 1
+            weightedCounts[event.kind, default: 0] += weight * severity
+            totalPenalty += weight * severity
+        }
+
+        let averagePenaltyPerRally = totalPenalty / Double(rallyCount)
+        let score = Int(min(max(100 - averagePenaltyPerRally * 10, 0), 100).rounded())
+        let mainIssueKind = MovementEvent.Kind.allCases.max { lhs, rhs in
+            let lhsCount = counts[lhs, default: 0]
+            let rhsCount = counts[rhs, default: 0]
+            if lhsCount == rhsCount {
+                return weightedCounts[lhs, default: 0] < weightedCounts[rhs, default: 0]
+            }
+            return lhsCount < rhsCount
+        }
+
+        return CoordinationScoreSummary(
+            score: score,
+            rallyCount: rallyCount,
+            totalPenalty: totalPenalty,
+            averagePenaltyPerRally: averagePenaltyPerRally,
+            counts: counts,
+            mainIssueText: coordinationMainIssueText(kind: mainIssueKind, count: mainIssueKind.map { counts[$0, default: 0] } ?? 0),
+            suggestion: coordinationSuggestion(for: mainIssueKind, score: score)
+        )
+    }
+
+    private func coordinationFeedbackWeight(for kind: MovementEvent.Kind) -> Double {
+        switch kind {
+        case .failedToClearHittingZone:
+            return 1.2
+        case .wrongExitDirection:
+            return 1.5
+        case .directRetreatToWaiting:
+            return 1.3
+        case .missingWaitingRecovery:
+            return 1.0
+        }
+    }
+
+    private func coordinationMainIssueText(kind: MovementEvent.Kind?, count: Int) -> String {
+        guard let kind, count > 0 else {
+            return localized(
+                appLanguage,
+                zh: "這段影片沒有偵測到明顯的輪轉或站位錯誤。",
+                en: "No major rotation or positioning issue was detected in this review."
+            )
+        }
+
+        return localized(
+            appLanguage,
+            zh: "\(coordinationBreakdownLabel(for: kind)) 出現 \(count) 次。",
+            en: "\(coordinationBreakdownLabel(for: kind)) happened \(count) \(count == 1 ? "time" : "times")."
+        )
+    }
+
+    private func coordinationSuggestion(for kind: MovementEvent.Kind?, score: Int) -> String {
+        guard let kind else {
+            return localized(
+                appLanguage,
+                zh: "維持現在的輪轉節奏，擊球後繼續快速讓出前場並回到等待補位區。",
+                en: "Keep the current rhythm: clear the hitting zone quickly and reset behind your partner after each shot."
+            )
+        }
+
+        switch kind {
+        case .failedToClearHittingZone:
+            return localized(
+                appLanguage,
+                zh: "優先練習擊球後立刻離開前場，讓隊友可以順利進入下一拍的擊球區。",
+                en: "Focus on clearing the front hitting zone immediately after contact so your partner has room to step in for the next shot."
+            )
+        case .wrongExitDirection:
+            return localized(
+                appLanguage,
+                zh: "擊球後優先往擊球側外側退出，避免切進隊友的補位路線，讓輪轉更順。",
+                en: "Focus on exiting outward after each shot to keep the rotation smooth and avoid cutting across your partner's recovery path."
+            )
+        case .directRetreatToWaiting:
+            return localized(
+                appLanguage,
+                zh: "不要擊球後直接往後退；先往側外側退出，再回到後方等待補位區，避免和隊友路線重疊。",
+                en: "Avoid moving straight back after hitting. Exit to the outside first, then reset behind your partner to prevent path conflicts."
+            )
+        case .missingWaitingRecovery:
+            return localized(
+                appLanguage,
+                zh: "退出到側邊後不要停留太久，隊友成為擊球員時應更快回到後方等待補位區。",
+                en: "Do not stay on the side after rotating out. Once your partner becomes the hitter, recover earlier into the waiting zone."
+            )
+        }
+    }
+
+    private func coordinationBreakdownLabel(for kind: MovementEvent.Kind) -> String {
+        switch kind {
+        case .failedToClearHittingZone:
+            return localized(appLanguage, zh: "擊球區停留太久", en: "Stayed in hitting zone too long")
+        case .wrongExitDirection:
+            return localized(appLanguage, zh: "退出方向錯誤", en: "Moved to the wrong side")
+        case .directRetreatToWaiting:
+            return localized(appLanguage, zh: "擊球後直接後退", en: "Moved straight back after hitting")
+        case .missingWaitingRecovery:
+            return localized(appLanguage, zh: "退出後停在側邊太久", en: "Stopped on the side after rotating out")
+        }
+    }
+
+    private func coordinationScoreColor(_ score: Int) -> Color {
+        if score >= 80 {
+            return .green
+        } else if score >= 60 {
+            return .orange
+        } else {
+            return .red
+        }
+    }
+
+    private func scoreNumberString(_ value: Double) -> String {
+        String(format: "%.1f", value)
     }
 
     private func reviewSuggestionList(session: ReviewSession) -> some View {
