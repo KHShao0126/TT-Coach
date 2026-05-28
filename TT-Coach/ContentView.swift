@@ -75,8 +75,7 @@ struct ContentView: View {
     @State private var calibrationPoints: [CGPoint] = []
     @State private var showLanguagePicker = false
     @State private var showHandednessPicker = false
-    @State private var showFeedbackModePicker = false
-    @State private var pendingHandednessMode: PlayerHandednessMode?
+    @State private var recordingStartedAt: Date?
 
     private var appLanguage: AppLanguage {
         AppLanguage(rawValue: appLanguageRawValue) ?? .chinese
@@ -138,24 +137,11 @@ struct ContentView: View {
         .confirmationDialog(localized(appLanguage, zh: "請選擇球員慣用手", en: "Choose Players' Dominant Hands"), isPresented: $showHandednessPicker, titleVisibility: .visible) {
             ForEach(PlayerHandednessMode.allCases, id: \.rawValue) { mode in
                 Button(mode.title(in: appLanguage)) {
-                    pendingHandednessMode = mode
-                    showFeedbackModePicker = true
+                    startCoachingMode(with: mode, feedbackMode: .afterRally)
                 }
             }
 
             Button(localized(appLanguage, zh: "取消", en: "Cancel"), role: .cancel) { }
-        }
-        .confirmationDialog(localized(appLanguage, zh: "請選擇 feedback 時機", en: "Choose Feedback Timing"), isPresented: $showFeedbackModePicker, titleVisibility: .visible) {
-            ForEach(LiveFeedbackMode.allCases, id: \.rawValue) { mode in
-                Button(mode.title(in: appLanguage)) {
-                    guard let pendingHandednessMode else { return }
-                    startCoachingMode(with: pendingHandednessMode, feedbackMode: mode)
-                }
-            }
-
-            Button(localized(appLanguage, zh: "取消", en: "Cancel"), role: .cancel) {
-                pendingHandednessMode = nil
-            }
         }
         .sheet(isPresented: $isVideoLibraryPresented) {
             SavedVideosView(videoLibrary: videoLibrary)
@@ -217,7 +203,7 @@ struct ContentView: View {
                     videoLibrary.refreshVideos()
                     isVideoLibraryPresented = true
                 } label: {
-                    Label(localized(appLanguage, zh: "已儲存影片", en: "Saved Videos"), systemImage: "film.stack")
+                    Label(localized(appLanguage, zh: "賽後分析", en: "Post-Game Analysis"), systemImage: "film.stack")
                         .font(.headline)
                         .frame(maxWidth: .infinity)
                         .padding()
@@ -226,11 +212,6 @@ struct ContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 18))
                 }
                 .padding(.horizontal, 32)
-
-                Text(localized(appLanguage, zh: "按下開始後會開啟相機、進入 AI 教練模式；若手機直放，會提示先橫放再開始錄影", en: "Tap Start to open the camera and enter AI coaching mode. If the phone is vertical, the app will ask you to rotate to landscape before recording starts."))
-                    .font(.footnote)
-                    .foregroundColor(.white.opacity(0.75))
-                    .padding(.bottom, 40)
             }
         }
     }
@@ -353,6 +334,9 @@ struct ContentView: View {
                 cameraManager.updatePlayerAreaCalibration(completedCalibration)
                 syncRecordingState(forLandscape: isLandscape)
             }
+            .onChange(of: cameraManager.isRecordingActive, initial: true) { _, isRecordingActive in
+                updateRecordingTimerState(isRecordingActive: isRecordingActive)
+            }
         }
     }
 
@@ -362,9 +346,17 @@ struct ContentView: View {
                 .fill(recordingBadgeColor)
                 .frame(width: 10, height: 10)
 
-            Text(recordingBadgeLabel)
-                .font(.headline)
-                .fontWeight(.bold)
+            Group {
+                if cameraManager.isRecordingActive {
+                    TimelineView(.periodic(from: recordingStartedAt ?? Date(), by: 1)) { context in
+                        Text(recordingDurationLabel(at: context.date))
+                    }
+                } else {
+                    Text(recordingBadgeLabel)
+                }
+            }
+            .font(.headline)
+            .fontWeight(.bold)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -421,9 +413,6 @@ struct ContentView: View {
     }
 
     private var recordingBadgeLabel: String {
-        if cameraManager.isRecordingActive {
-            return "REC"
-        }
         if isWaitingForLandscapeRecording {
             return localized(appLanguage, zh: "等待橫放", en: "Waiting for Landscape")
         }
@@ -431,6 +420,19 @@ struct ContentView: View {
             return localized(appLanguage, zh: "等待標定", en: "Waiting for Calibration")
         }
         return localized(appLanguage, zh: "待命", en: "Standby")
+    }
+
+    private func recordingDurationLabel(at date: Date) -> String {
+        let elapsedTime = recordingStartedAt.map { date.timeIntervalSince($0) } ?? 0
+        let totalSeconds = max(Int(elapsedTime.rounded(.down)), 0)
+        let hours = totalSeconds / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, seconds)
+        }
+        return String(format: "%02d:%02d", minutes, seconds)
     }
 
     private var recordingBadgeColor: Color {
@@ -479,6 +481,14 @@ struct ContentView: View {
         }
     }
 
+    private func updateRecordingTimerState(isRecordingActive: Bool) {
+        if isRecordingActive {
+            recordingStartedAt = Date()
+        } else {
+            recordingStartedAt = nil
+        }
+    }
+
     private func handleCalibrationTap(_ capturePoint: CGPoint) {
         guard !cameraManager.isRecordingActive else { return }
         guard calibrationPoints.count < 3 else { return }
@@ -497,7 +507,6 @@ struct ContentView: View {
 
     private func startCoachingMode(with handednessMode: PlayerHandednessMode, feedbackMode: LiveFeedbackMode) {
         resetCalibration()
-        pendingHandednessMode = nil
         cameraManager.requestPermissionAndStart(handednessMode: handednessMode, feedbackMode: feedbackMode) { started in
             if started {
                 isCoachingMode = true
@@ -2387,7 +2396,6 @@ struct SavedVideosView: View {
     @ObservedObject var videoLibrary: VideoLibraryManager
     @Environment(\.dismiss) private var dismiss
     @AppStorage(appLanguageStorageKey) private var appLanguageRawValue = AppLanguage.chinese.rawValue
-    @State private var selectedVideo: SavedVideo?
     @State private var reviewingVideo: SavedVideo?
     @State private var importedVideoItem: PhotosPickerItem?
     @State private var renamingVideo: SavedVideo?
@@ -2414,7 +2422,7 @@ struct SavedVideosView: View {
                         List {
                             ForEach(videoLibrary.videos) { video in
                                 Button {
-                                    selectedVideo = video
+                                    reviewingVideo = video
                                 } label: {
                                     HStack(spacing: 12) {
                                         Image(systemName: "video.fill")
@@ -2488,9 +2496,6 @@ struct SavedVideosView: View {
                     }
                     .disabled(isImportingVideo)
                 }
-            }
-            .sheet(item: $selectedVideo) { video in
-                VideoPlayerScreen(video: video)
             }
             .sheet(item: $reviewingVideo) { video in
                 VideoReviewScreen(video: video)
@@ -4352,7 +4357,7 @@ final class CameraManager: NSObject, ObservableObject {
     @Published private(set) var isRecordingActive = false
     @Published private(set) var rallyState: RallyState = .end
     @Published private(set) var playerAreaSpatialStatus = PlayerAreaSpatialStatus.uncalibrated
-    @Published private(set) var selectedLiveFeedbackMode: LiveFeedbackMode = .duringRally
+    @Published private(set) var selectedLiveFeedbackMode: LiveFeedbackMode = .afterRally
     @Published private(set) var afterRallyDebugItems: [AfterRallyDebugItem] = []
 
     private let videoDataOutput = AVCaptureVideoDataOutput()
@@ -4459,7 +4464,7 @@ final class CameraManager: NSObject, ObservableObject {
     private var rallyMotionState = RallyMotionState()
     private var activeHitterState: ActiveHitterState?
     private var pendingDirectionalCue: PendingDirectionalCue?
-    private var liveFeedbackMode: LiveFeedbackMode = .duringRally
+    private var liveFeedbackMode: LiveFeedbackMode = .afterRally
     private var livePlayerFeedbackPhases: [String: LivePlayerFeedbackPhase] = [:]
     private var afterRallyFeedbackEvents = Set<AfterRallyFeedbackEvent>()
     private var audioFeedbackMuteUntil: CFTimeInterval = 0
