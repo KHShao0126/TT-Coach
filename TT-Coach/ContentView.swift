@@ -2994,7 +2994,6 @@ struct VideoReviewScreen: View {
                     if let session {
                         activeReviewInsight()
                         reviewTimeline(session: session)
-                        reviewSummary(session: session)
                         reviewSuggestionList(session: session)
                         reviewEventList(session: session)
                         coordinationScoreCard(session: session)
@@ -3126,23 +3125,6 @@ struct VideoReviewScreen: View {
                 }
             }
         }
-    }
-
-    private func reviewSummary(session: ReviewSession) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(localized(appLanguage, zh: "分析摘要", en: "Review Session"))
-                .font(.headline)
-
-            HStack {
-                reviewStat(title: localized(appLanguage, zh: "影片長度", en: "Duration"), value: reviewTimeString(session.duration))
-                reviewStat(title: localized(appLanguage, zh: "分析影格", en: "Frames"), value: "\(session.trackFrames.count)")
-                reviewStat(title: localized(appLanguage, zh: "事件點", en: "Events"), value: "\(session.movementEvents.count)")
-                reviewStat(title: localized(appLanguage, zh: "AI 建議", en: "AI Tips"), value: "\(session.suggestions.count)")
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(18)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
     }
 
     private func reviewTimeline(session: ReviewSession) -> some View {
@@ -3504,17 +3486,6 @@ struct VideoReviewScreen: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(18)
         .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
-    }
-
-    private func reviewStat(title: String, value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text(value)
-                .font(.headline.monospacedDigit())
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @MainActor
@@ -5989,87 +5960,7 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
             .cropped(to: recordingCropRect)
             .transformed(by: CGAffineTransform(translationX: -recordingCropRect.origin.x, y: -recordingCropRect.origin.y))
         ciContext.render(croppedImage, to: renderedPixelBuffer)
-        drawTrackedPlayers(
-            on: renderedPixelBuffer,
-            players: latestTrackedPlayers,
-            cropRect: recordingCropRect,
-            renderSize: recordingRenderSize,
-            sourceCanvasSize: recordingSourceCanvasSize
-        )
         return renderedPixelBuffer
-    }
-
-    private func drawTrackedPlayers(
-        on pixelBuffer: CVPixelBuffer,
-        players: [TrackedPlayerBox],
-        cropRect: CGRect,
-        renderSize: CGSize,
-        sourceCanvasSize: CGSize
-    ) {
-        CVPixelBufferLockBaseAddress(pixelBuffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
-
-        guard
-            let baseAddress = CVPixelBufferGetBaseAddress(pixelBuffer)
-        else { return }
-
-        let width = CVPixelBufferGetWidth(pixelBuffer)
-        let height = CVPixelBufferGetHeight(pixelBuffer)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-
-        guard
-            let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-            let context = CGContext(
-                data: baseAddress,
-                width: width,
-                height: height,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: colorSpace,
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
-            )
-        else { return }
-
-        context.setLineWidth(6)
-        context.setFillColor(UIColor.systemGreen.cgColor)
-
-        for player in players {
-            let box = transformedBoundingBoxForRecordedFrame(from: player.boundingBox)
-            let sourceRect = CGRect(
-                x: box.origin.x * sourceCanvasSize.width,
-                y: (1 - box.origin.y - box.height) * sourceCanvasSize.height,
-                width: box.width * sourceCanvasSize.width,
-                height: box.height * sourceCanvasSize.height
-            )
-            let rect = CGRect(
-                x: sourceRect.origin.x - cropRect.origin.x,
-                y: sourceRect.origin.y - cropRect.origin.y,
-                width: sourceRect.width,
-                height: sourceRect.height
-            )
-            context.setStrokeColor((player.isCurrentHitter ? UIColor.systemRed : UIColor.systemGreen).cgColor)
-            context.stroke(rect.insetBy(dx: 1, dy: 1))
-
-            let labelRect = CGRect(x: rect.minX, y: max(rect.minY - 34, 8), width: 120, height: 28)
-            context.setFillColor(UIColor.systemGreen.cgColor)
-            context.fill(labelRect)
-
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: UIFont.boldSystemFont(ofSize: 18),
-                .foregroundColor: UIColor.black
-            ]
-            drawVideoText(
-                player.label,
-                in: labelRect.insetBy(dx: 8, dy: 4),
-                attributes: attributes,
-                context: context,
-                canvasHeight: height
-            )
-        }
-    }
-
-    private func transformedBoundingBoxForRecordedFrame(from orientedBoundingBox: CGRect) -> CGRect {
-        orientedBoundingBox
     }
 
     private func makeRecordingGeometry(canvasSize: CGSize) -> (cropRect: CGRect, renderSize: CGSize) {
@@ -6090,30 +5981,6 @@ extension CameraManager: AVCaptureVideoDataOutputSampleBufferDelegate, AVCapture
         let cropRect = CGRect(x: cropX, y: cropY, width: cropWidth, height: cropHeight)
 
         return (cropRect, CGSize(width: cropWidth, height: cropHeight))
-    }
-
-    private func drawVideoText(
-        _ text: String,
-        in rect: CGRect,
-        attributes: [NSAttributedString.Key: Any],
-        context: CGContext,
-        canvasHeight: Int
-    ) {
-        context.saveGState()
-        context.translateBy(x: 0, y: CGFloat(canvasHeight))
-        context.scaleBy(x: 1, y: -1)
-
-        let flippedRect = CGRect(
-            x: rect.origin.x,
-            y: CGFloat(canvasHeight) - rect.origin.y - rect.height,
-            width: rect.width,
-            height: rect.height
-        )
-
-        UIGraphicsPushContext(context)
-        NSString(string: text).draw(in: flippedRect, withAttributes: attributes)
-        UIGraphicsPopContext()
-        context.restoreGState()
     }
 
     private func finishRecording() {
